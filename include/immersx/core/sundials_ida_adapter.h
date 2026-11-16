@@ -25,7 +25,7 @@
 #include <deal.II/lac/vector_memory.h>
 
 #include <immersx/core/detail/execution_composition.h>
-#include <immersx/core/ida_lagging_policy.templates.h>
+#include <immersx/core/ida_lagging_policy.h>
 #include <immersx/core/problem_handle.h>
 #include <immersx/core/time_parameters.h>
 

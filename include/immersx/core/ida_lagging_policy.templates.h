@@ -420,7 +420,7 @@ namespace ImmersX
                      << std::setw(14) << seg.alpha << std::setw(14)
                      << seg.dalpha << std::setw(14) << seg.sigma
                      << std::setw(14) << seg.euclid << "  " << std::left
-                     << std::setw(14) << seg.decision << std::right
+                     << std::setw(15) << seg.decision << std::right
                      << std::setw(10) << seg.m_hat << std::setw(14) << seg.E_hat
                      << std::setw(14) << seg.A << std::setw(4) << seg.c
                      << std::setw(4) << seg.b << std::setw(6) << seg.n_solves
@@ -921,7 +921,7 @@ namespace ImmersX
       << "#" << std::setw(5) << "seg" << std::setw(14) << "t" << std::setw(14)
       << "alpha" << std::setw(14) << "dalpha" << std::setw(14) << "sigma"
       << std::setw(14) << "euclid"
-      << "  " << std::left << std::setw(14) << "decision" << std::right
+      << "  " << std::left << std::setw(15) << "decision" << std::right
       << std::setw(10) << "m_hat" << std::setw(14) << "E_hat" << std::setw(14)
       << "A" << std::setw(4) << "c" << std::setw(4) << "b" << std::setw(6)
       << "n" << std::setw(6) << "n_lag" << std::setw(6) << "m1" << std::setw(14)
