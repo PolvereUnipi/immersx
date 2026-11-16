@@ -1,0 +1,572 @@
+// ---------------------------------------------------------------------
+// Copyright (C) 2026 by Luca Heltai
+// This file is part of ImmersX, based on deal.II.
+// ---------------------------------------------------------------------
+#include <gtest/gtest.h>
+#include <immersx/algebra/linear_algebra.h>
+#include <immersx/core/ida_lagging_policy.h>
+
+#ifndef IMMERSX_USE_PETSC_LA
+#  include <deal.II/base/index_set.h>
+#  include <deal.II/base/mpi.h>
+
+#  include <deal.II/lac/trilinos_solver.h>
+#  include <deal.II/lac/trilinos_sparse_matrix.h>
+#  include <deal.II/lac/trilinos_sparsity_pattern.h>
+
+#  include <chrono>
+#  include <cmath>
+#  include <filesystem>
+#  include <fstream>
+#  include <memory>
+#  include <sstream>
+#  include <string>
+#  include <thread>
+#  include <vector>
+
+#  include "test_paths.h"
+
+namespace
+{
+  using namespace ImmersX;
+  using Vector = ImmersXLA::MPI::Vector;
+  using Policy = IDALaggingPolicy<Vector>;
+
+  // J(t, y, alpha) = K + (alpha + 0.1 t + 0.01 ||y||) I with a nonsymmetric
+  // tridiagonal K, distributed over all ranks. The factorization acts on a
+  // copy, so it stays fixed while J changes, as a lagged seed must. The
+  // optional delays make the policy's timing rules fire deterministically.
+  // The error weights mimic IDA's, 1 / (rtol |y| + atol), at the state of the
+  // last step, times weight_scale.
+  struct ToySystem
+  {
+    static constexpr unsigned int n = 24;
+
+    ToySystem()
+      : owned(dealii::Utilities::MPI::create_evenly_distributed_partitioning(
+          MPI_COMM_WORLD,
+          n))
+    {
+      dealii::TrilinosWrappers::SparsityPattern pattern(owned,
+                                                        owned,
+                                                        MPI_COMM_WORLD,
+                                                        3);
+      for (const auto i : owned)
+        {
+          pattern.add(i, i);
+          if (i > 0)
+            pattern.add(i, i - 1);
+          if (i + 1 < n)
+            pattern.add(i, i + 1);
+        }
+      pattern.compress();
+      jacobian.reinit(pattern);
+      factored.reinit(pattern);
+      state = vector();
+    }
+
+    void
+    build(const double t, const Vector &y, const double alpha)
+    {
+      const double shift = alpha + .1 * t + .01 * y.l2_norm();
+      for (const auto i : owned)
+        {
+          jacobian.set(i, i, 2. + shift);
+          if (i > 0)
+            jacobian.set(i, i - 1, -1.);
+          if (i + 1 < n)
+            jacobian.set(i, i + 1, -.5);
+        }
+      jacobian.compress(dealii::VectorOperation::insert);
+    }
+
+    Vector
+    vector(const double scale = 1.) const
+    {
+      Vector v(owned, MPI_COMM_WORLD);
+      for (const auto i : owned)
+        v(i) = scale * (1. + std::sin(1. + i));
+      v.compress(dealii::VectorOperation::insert);
+      return v;
+    }
+
+    void
+    weights(Vector &w) const
+    {
+      w.reinit(owned, MPI_COMM_WORLD);
+      for (const auto i : owned)
+        w(i) = weight_scale / (1.e-3 * std::abs(state(i)) + 1.e-4);
+      w.compress(dealii::VectorOperation::insert);
+    }
+
+    // ||J z - r||_2 with the Jacobian assembled last.
+    double
+    residual_norm(const Vector &z, const Vector &r) const
+    {
+      Vector Jz(r);
+      jacobian.vmult(Jz, z);
+      Jz -= r;
+      return Jz.l2_norm();
+    }
+
+    Policy::Operations
+    operations()
+    {
+      Policy::Operations ops;
+      ops.build_jacobian = [this](const double  t,
+                                  const Vector &y,
+                                  const Vector &,
+                                  const double alpha) { build(t, y, alpha); };
+      ops.factorize      = [this]() {
+        std::this_thread::sleep_for(factorize_delay);
+        factored.copy_from(jacobian);
+        direct = std::make_unique<dealii::TrilinosWrappers::SolverDirect>();
+        direct->initialize(factored);
+      };
+      ops.apply_factorization = [this](Vector &dst, const Vector &src) {
+        direct->solve(dst, src);
+      };
+      ops.direct_solve   = ops.apply_factorization;
+      ops.apply_jacobian = [this](Vector &dst, const Vector &src) {
+        std::this_thread::sleep_for(jacobian_delay);
+        jacobian.vmult(dst, src);
+      };
+      ops.error_weights = [this](Vector &w) { weights(w); };
+      return ops;
+    }
+
+    dealii::IndexSet                                        owned;
+    dealii::TrilinosWrappers::SparseMatrix                  jacobian, factored;
+    std::unique_ptr<dealii::TrilinosWrappers::SolverDirect> direct;
+    std::chrono::milliseconds factorize_delay{0}, jacobian_delay{0};
+    Vector                    state;
+    double                    weight_scale = 1.;
+  };
+
+  // T_F >= 10 ms and every Jacobian product >= 50 ms: R1 keeps the first
+  // factorization (predicted cost T_a < T_F), and the first lagged solve
+  // fires R2 (E_s >= T_F).
+  void
+  make_lagged_solves_expensive(ToySystem &system)
+  {
+    system.factorize_delay = std::chrono::milliseconds(10);
+    system.jacobian_delay  = std::chrono::milliseconds(50);
+  }
+
+  // Mode ida: GMRES stops at ||b - Jx||_2 <= the tolerance passed, so the
+  // scenario tests below can prescribe the accuracy of every solve.
+  IDALaggingParameters
+  parameters(const std::string &policy)
+  {
+    IDALaggingParameters result;
+    result.policy               = policy;
+    result.gmres_tolerance_mode = "ida";
+    return result;
+  }
+
+  // One IDA step: a residual at t, an optional Jacobian setup, and solves.
+  void
+  step(Policy            &policy,
+       ToySystem         &system,
+       const double       t,
+       const double       alpha,
+       const bool         setup,
+       const unsigned int n_solves,
+       const double       relative_tolerance,
+       const double       max_relative_error)
+  {
+    const auto y = system.vector(1. + t);
+    const auto r = system.vector(-1.);
+    system.state = y;
+    policy.residual(t, y, y);
+    if (setup)
+      policy.setup_jacobian(t, y, y, alpha);
+    for (unsigned int k = 0; k < n_solves; ++k)
+      {
+        Vector z(r);
+        policy.solve(r, z, relative_tolerance * r.l2_norm());
+        EXPECT_LE(system.residual_norm(z, r), max_relative_error * r.l2_norm());
+      }
+  }
+
+  std::string
+  log_prefix(const std::string &name)
+  {
+    const auto directory = TestPaths::output_path("ida_lagging_policy_01");
+    if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+      std::filesystem::create_directories(directory);
+    return (directory / (name + "_np" +
+                         std::to_string(dealii::Utilities::MPI::n_mpi_processes(
+                           MPI_COMM_WORLD))))
+      .string();
+  }
+
+  // Data rows of a log, split into whitespace-separated fields.
+  std::vector<std::vector<std::string>>
+  rows(const std::string &path)
+  {
+    std::ifstream file(path);
+    EXPECT_TRUE(file) << path;
+    std::vector<std::vector<std::string>> result;
+    for (std::string line; std::getline(file, line);)
+      if (!line.empty() && line[0] != '#')
+        {
+          std::istringstream       fields(line);
+          std::vector<std::string> row;
+          for (std::string field; fields >> field;)
+            row.push_back(field);
+          result.push_back(row);
+        }
+    return result;
+  }
+} // namespace
+
+TEST(IDALaggingPolicy, BOTH_RejectsOffAndMissingOperations)
+{
+  ToySystem system;
+  EXPECT_THROW(
+    Policy(parameters("off"), {}, MPI_COMM_WORLD, system.operations()),
+    dealii::ExceptionBase);
+  auto ops         = system.operations();
+  ops.direct_solve = {};
+  EXPECT_THROW(Policy(parameters("direct"), {}, MPI_COMM_WORLD, ops),
+               dealii::ExceptionBase);
+}
+
+TEST(IDALaggingPolicy, BOTH_DirectFactorizesEveryJacobian)
+{
+  ToySystem system;
+  Policy policy(parameters("direct"), {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  for (unsigned int s = 0; s < 5; ++s)
+    step(policy, system, .1 * s, 1. + s, true, 2, 1.e-10, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.jacobian_evaluations, 5u);
+  EXPECT_EQ(totals.factorizations, 5u);
+  EXPECT_EQ(totals.direct_solves, 10u);
+  EXPECT_EQ(totals.lagged_solves, 0u);
+}
+
+TEST(IDALaggingPolicy, BOTH_LagAlwaysKeepsTheFirstFactorization)
+{
+  ToySystem system;
+  Policy    policy(parameters("lag_always"),
+                   {},
+                MPI_COMM_WORLD,
+                system.operations());
+  policy.start();
+  for (unsigned int s = 0; s < 5; ++s)
+    step(policy, system, .1 * s, 1. + .05 * s, true, 2, 1.e-10, 1.e-9);
+  policy.finish();
+
+  // The first segment is direct; every later solve is a converged GMRES
+  // solve on the current Jacobian with the first factorization.
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.jacobian_evaluations, 5u);
+  EXPECT_EQ(totals.factorizations, 1u);
+  EXPECT_EQ(totals.direct_solves, 2u);
+  EXPECT_EQ(totals.lagged_solves, 8u);
+  EXPECT_EQ(totals.fired_R3, 0u);
+  EXPECT_GT(totals.gmres_iterations, totals.lagged_solves);
+}
+
+TEST(IDALaggingPolicy, BOTH_CapForcesRefactorizationAndDirectSolve)
+{
+  ToySystem system;
+  auto      knobs              = parameters("lag_always");
+  knobs.absolute_iteration_cap = 1;
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  // A large alpha jump: one GMRES iteration cannot reach the tolerance.
+  step(policy, system, .1, 50., true, 2, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.factorizations, 2u);
+  EXPECT_EQ(totals.fired_R3, 1u);
+  EXPECT_EQ(totals.lagged_solves, 1u);
+  // The abandoned solve is redone directly, and so is the next one.
+  EXPECT_EQ(totals.direct_solves, 3u);
+}
+
+TEST(IDALaggingPolicy, BOTH_RebuildEverySolveFollowsTheLatestIterate)
+{
+  ToySystem system;
+  auto      knobs                       = parameters("direct");
+  knobs.operator_rebuild_every_n_solves = 1;
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  // IDA calls setup_jacobian once; every later Newton iterate rebuilds J at
+  // the state of the latest residual. The solve check uses that J.
+  step(policy, system, .1, 2., true, 1, 1.e-12, 1.e-10);
+  for (unsigned int k = 1; k < 4; ++k)
+    step(policy, system, .1 + k * .01, 2., false, 1, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.jacobian_evaluations, 4u);
+  EXPECT_EQ(totals.factorizations, 4u);
+  EXPECT_EQ(totals.direct_solves, 4u);
+}
+
+TEST(IDALaggingPolicy, BOTH_DeferredR2FactorizesTheNextJacobian)
+{
+  ToySystem system;
+  make_lagged_solves_expensive(system);
+  auto knobs                            = parameters("adaptive");
+  knobs.operator_rebuild_every_n_solves = 1;
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  // Standard Newton: every solve has its own Jacobian. R2 fires after the
+  // lagged solve and factorizes the Jacobian of the next solve.
+  step(policy, system, .01, 1., false, 1, 1.e-12, 1.e-10);
+  step(policy, system, .02, 1., false, 1, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.fired_R2, 1u);
+  EXPECT_EQ(totals.deferred_new_jacobian, 1u);
+  EXPECT_EQ(totals.deferred_same_jacobian, 0u);
+  EXPECT_EQ(totals.factorizations, 2u);
+  EXPECT_EQ(totals.lagged_solves, 1u);
+  EXPECT_EQ(totals.direct_solves, 2u);
+}
+
+TEST(IDALaggingPolicy, BOTH_DeferredR2WithinASegment)
+{
+  ToySystem system;
+  make_lagged_solves_expensive(system);
+  Policy policy(parameters("adaptive"),
+                {},
+                MPI_COMM_WORLD,
+                system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  // Modified Newton: the second solve of the segment reuses J_s, which is
+  // factorized before that solve.
+  step(policy, system, .01, 1.01, true, 2, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.fired_R2, 1u);
+  EXPECT_EQ(totals.deferred_new_jacobian, 0u);
+  EXPECT_EQ(totals.deferred_same_jacobian, 1u);
+  EXPECT_EQ(totals.factorizations, 2u);
+  EXPECT_EQ(totals.lagged_solves, 1u);
+  EXPECT_EQ(totals.direct_solves, 2u);
+}
+
+TEST(IDALaggingPolicy, BOTH_DeferredR2IsDroppedAtTheEnd)
+{
+  ToySystem system;
+  make_lagged_solves_expensive(system);
+  Policy policy(parameters("adaptive"),
+                {},
+                MPI_COMM_WORLD,
+                system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  step(policy, system, .01, 1.01, true, 1, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.fired_R2, 1u);
+  EXPECT_EQ(totals.deferred_dropped, 1u);
+  EXPECT_EQ(totals.factorizations, 1u);
+  EXPECT_EQ(totals.lagged_solves, 1u);
+}
+
+TEST(IDALaggingPolicy, BOTH_R1RefactorizesBeforeTheNextSolve)
+{
+  ToySystem system;
+  system.factorize_delay = std::chrono::milliseconds(200);
+  system.jacobian_delay  = std::chrono::milliseconds(30);
+  Policy policy(parameters("adaptive"),
+                {},
+                MPI_COMM_WORLD,
+                system.operations());
+  policy.start();
+  // 20 direct solves: the episode average A = T_F / 20 stays below the cost
+  // of one GMRES iteration (>= 30 ms), but above T_a, so R1 keeps the
+  // factorization at the next Jacobian.
+  step(policy, system, 0., 1., true, 20, 1.e-12, 1.e-10);
+  // The first lagged solve needs a few iterations, below the R2 budget
+  // T_F >= 200 ms. Before the second solve, its predicted cost (at least one
+  // iteration) exceeds A, so R1 refactorizes J_s and that solve is direct.
+  step(policy, system, .01, 1.01, true, 2, 1.e-4, 1.e-3);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.keep_R1, 1u);
+  EXPECT_EQ(totals.refact_R1_solve, 1u);
+  EXPECT_EQ(totals.fired_R2, 0u);
+  EXPECT_EQ(totals.factorizations, 2u);
+  EXPECT_EQ(totals.lagged_solves, 1u);
+  EXPECT_EQ(totals.direct_solves, 21u);
+}
+
+// ida_forcing: from IDA's tolerance tol = nrmfac eps_L / wbar, the policy
+// recovers eps_L and asks GMRES for ||b - Jz||_2 <= eta ||b||_2 with
+// eta = sqrt(N) eps_L / ||W M^-1 b||_2. The result must not depend on
+// ls_norm_factor.
+TEST(IDALaggingPolicy, BOTH_ForcingTermFollowsIDAsLinearTolerance)
+{
+  const double       eps_L = 1.e-3;
+  const unsigned int N     = ToySystem::n;
+  unsigned int       iterations[2];
+  for (const unsigned int variant : {0u, 1u})
+    {
+      ToySystem    system;
+      const double nrmfac        = variant == 0 ? 1. : std::sqrt(double(N));
+      auto         knobs         = parameters("lag_always");
+      knobs.gmres_tolerance_mode = "ida_forcing";
+      Policy::IDATolerance tolerance;
+      tolerance.ls_norm_factor            = variant == 0 ? 1. : 0.;
+      tolerance.expected_linear_tolerance = eps_L;
+      Policy policy(knobs, tolerance, MPI_COMM_WORLD, system.operations());
+      policy.start();
+      for (unsigned int s = 0; s < 4; ++s)
+        {
+          const double t = .1 * s;
+          const auto   y = system.vector(1. + t);
+          const auto   r = system.vector(-1.);
+          system.state   = y;
+          policy.residual(t, y, y);
+          policy.setup_jacobian(t, y, y, 1. + .05 * s);
+
+          Vector w;
+          system.weights(w);
+          const double wbar = w.l2_norm() / std::sqrt(double(N));
+          Vector       z(r);
+          // The factorization before the solve is the one GMRES uses.
+          Vector Mr(r);
+          if (s > 0)
+            system.direct->solve(Mr, r);
+          policy.solve(r, z, nrmfac * eps_L / wbar);
+          if (s > 0)
+            {
+              Mr.scale(w);
+              const double eta = std::sqrt(double(N)) * eps_L / Mr.l2_norm();
+              ASSERT_LT(eta, 1.);
+              EXPECT_LE(system.residual_norm(z, r),
+                        eta * r.l2_norm() * (1. + 1.e-6));
+            }
+        }
+      policy.finish();
+      const auto &totals = policy.totals();
+      EXPECT_EQ(totals.factorizations, 1u);
+      EXPECT_EQ(totals.lagged_solves, 3u);
+      EXPECT_NEAR(totals.eps_ratio_min, 1., 1.e-12);
+      EXPECT_NEAR(totals.eps_ratio_max, 1., 1.e-12);
+      iterations[variant] = totals.gmres_iterations;
+    }
+  EXPECT_GT(iterations[0], 0u);
+  EXPECT_EQ(iterations[0], iterations[1]);
+}
+
+// ida_forcing with eta >= 1: M^{-1} b already passes IDA's test and is the
+// correction, without GMRES iterations.
+TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
+{
+  ToySystem system;
+  auto      knobs            = parameters("lag_always");
+  knobs.gmres_tolerance_mode = "ida_forcing";
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  const auto r = system.vector(-1.);
+  for (unsigned int s = 1; s < 4; ++s)
+    {
+      const auto y = system.vector(1. + .1 * s);
+      system.state = y;
+      policy.residual(.1 * s, y, y);
+      policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
+      Vector z(r), Mr(r);
+      system.direct->solve(Mr, r);
+      policy.solve(r, z, 1.e8);
+      z -= Mr;
+      EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm());
+    }
+  policy.finish();
+  EXPECT_EQ(policy.totals().lagged_solves, 3u);
+  EXPECT_EQ(policy.totals().gmres_iterations, 0u);
+}
+
+// The predicted state part scales with Sigma_s / Sigma_l, both measured in
+// IDA's current weights: a uniform change of the weights between the two
+// measurements must not change it.
+TEST(IDALaggingPolicy, BOTH_DriftRatioIgnoresAUniformWeightChange)
+{
+  std::vector<std::vector<std::string>> segments[2];
+  for (const unsigned int variant : {0u, 1u})
+    {
+      ToySystem system;
+      auto      knobs            = parameters("lag_always");
+      knobs.gmres_tolerance_mode = "fixed";
+      knobs.log_prefix = log_prefix("drift_weights_" + std::to_string(variant));
+      Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+      policy.start();
+      for (unsigned int s = 0; s < 5; ++s)
+        {
+          // Constant alpha: theta_D = 0, so the whole pooled factor is the
+          // state part.
+          if (variant == 1 && s == 3)
+            system.weight_scale = 10.;
+          step(policy, system, .1 * s, 1., true, 1, 1., 1.e-6);
+        }
+      policy.finish();
+      if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+        segments[variant] = rows(knobs.log_prefix + "_segments.log");
+    }
+  if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+    {
+      ASSERT_EQ(segments[0].size(), 5u);
+      ASSERT_EQ(segments[1].size(), 5u);
+      // Column 22 is theta_y. Segments 3-5 (rows 2-4) have a carried factor.
+      // At segment 4 the carried displacement dates from before the weight
+      // change and the current one from after it; a ratio of norms taken
+      // with different weights would differ by the factor 10 there.
+      constexpr unsigned int theta_y = 22;
+      for (const unsigned int row : {2u, 3u, 4u})
+        {
+          const double a = std::stod(segments[0][row][theta_y]);
+          const double b = std::stod(segments[1][row][theta_y]);
+          EXPECT_GT(a, 0.);
+          EXPECT_NEAR(a, b, 1.e-3 * a) << "segment " << row + 1;
+        }
+    }
+}
+
+TEST(IDALaggingPolicy, BOTH_AdaptiveWritesOneRowPerSolveAndSegment)
+{
+  ToySystem system;
+  auto      knobs  = parameters("adaptive");
+  knobs.log_prefix = log_prefix("adaptive");
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start("IDA: test header");
+  for (unsigned int s = 0; s < 4; ++s)
+    step(policy, system, .1 * s, 1. + .05 * s, true, 3, 1.e-10, 1.e-9);
+  policy.finish("test statistics");
+
+  if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+    {
+      const std::string prefix = knobs.log_prefix;
+      EXPECT_EQ(rows(prefix + "_solves.log").size(), 12u);
+      EXPECT_EQ(rows(prefix + "_segments.log").size(), 4u);
+      EXPECT_EQ(rows(prefix + "_episodes.log").size(),
+                policy.totals().factorizations);
+      std::ifstream     summary(prefix + "_summary.log");
+      const std::string text((std::istreambuf_iterator<char>(summary)),
+                             std::istreambuf_iterator<char>());
+      EXPECT_NE(text.find("IDA: test header"), std::string::npos);
+      EXPECT_NE(text.find("Policy                          = adaptive"),
+                std::string::npos);
+      EXPECT_NE(text.find("factorizations        "), std::string::npos);
+      EXPECT_NE(text.find("test statistics"), std::string::npos);
+    }
+}
+#endif

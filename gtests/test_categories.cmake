@@ -10,6 +10,7 @@ set(IMMERSX_UNIT_TEST_SUITES
     TestWatchdog
     ContributorCore
     SecondOrderCondensation
+    IDALaggingPolicy
     DimensionParameters
     CouplingNames
     FESpace
