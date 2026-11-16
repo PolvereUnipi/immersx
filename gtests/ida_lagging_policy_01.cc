@@ -36,8 +36,9 @@ namespace
   // tridiagonal K, distributed over all ranks. The factorization acts on a
   // copy, so it stays fixed while J changes, as a lagged seed must. The
   // optional delays make the policy's timing rules fire deterministically.
-  // The error weights mimic IDA's, 1 / (rtol |y| + atol), at the state of the
-  // last step, times weight_scale.
+  // The error weights mimic IDA's, 1 / (rtol |y| + atol): IDA's current
+  // ones at the state of the last step, times weight_scale (a tolerance
+  // ramp), and the final ones at a given state.
   struct ToySystem
   {
     static constexpr unsigned int n = 24;
@@ -93,10 +94,28 @@ namespace
     void
     weights(Vector &w) const
     {
+      final_weights(state, w);
+      w *= weight_scale;
+    }
+
+    void
+    final_weights(const Vector &y, Vector &w) const
+    {
       w.reinit(owned, MPI_COMM_WORLD);
       for (const auto i : owned)
-        w(i) = weight_scale / (1.e-3 * std::abs(state(i)) + 1.e-4);
+        w(i) = 1. / (1.e-3 * std::abs(y(i)) + 1.e-4);
       w.compress(dealii::VectorOperation::insert);
+    }
+
+    // ||d .* w||_2 / sqrt(N) with the final weights at y.
+    double
+    wrms(const Vector &d, const Vector &y) const
+    {
+      Vector w;
+      final_weights(y, w);
+      Vector scaled(d);
+      scaled.scale(w);
+      return scaled.l2_norm() / std::sqrt(static_cast<double>(n));
     }
 
     // ||J z - r||_2 with the Jacobian assembled last.
@@ -132,6 +151,9 @@ namespace
         jacobian.vmult(dst, src);
       };
       ops.error_weights = [this](Vector &w) { weights(w); };
+      ops.state_weights = [this](const Vector &y, Vector &w) {
+        final_weights(y, w);
+      };
       return ops;
     }
 
@@ -290,6 +312,29 @@ TEST(IDALaggingPolicy, BOTH_CapForcesRefactorizationAndDirectSolve)
   EXPECT_EQ(totals.lagged_solves, 1u);
   // The abandoned solve is redone directly, and so is the next one.
   EXPECT_EQ(totals.direct_solves, 3u);
+}
+
+TEST(IDALaggingPolicy, BOTH_ExternalFactorizationStartsANewEpisode)
+{
+  ToySystem system;
+  Policy    policy(parameters("lag_always"),
+                   {},
+                MPI_COMM_WORLD,
+                system.operations());
+  policy.start();
+  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+  step(policy, system, .1, 1.05, true, 1, 1.e-12, 1.e-10);
+  // The caller factorized another matrix: lag_always must not keep using it
+  // as the seed, so the next Jacobian is factorized and solved directly.
+  policy.reset_factorization();
+  step(policy, system, .2, 1.1, true, 1, 1.e-12, 1.e-10);
+  step(policy, system, .3, 1.15, true, 1, 1.e-12, 1.e-10);
+  policy.finish();
+
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.factorizations, 2u);
+  EXPECT_EQ(totals.direct_solves, 2u);
+  EXPECT_EQ(totals.lagged_solves, 2u);
 }
 
 TEST(IDALaggingPolicy, BOTH_RebuildEverySolveFollowsTheLatestIterate)
@@ -496,49 +541,80 @@ TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
   EXPECT_EQ(policy.totals().gmres_iterations, 0u);
 }
 
-// The predicted state part scales with Sigma_s / Sigma_l, both measured in
-// IDA's current weights: a uniform change of the weights between the two
-// measurements must not change it.
-TEST(IDALaggingPolicy, BOTH_DriftRatioIgnoresAUniformWeightChange)
+// Each state drift is measured from its own seed with that seed's final
+// weights. After an external factorization the carried factor comes from an
+// earlier seed: the prediction then uses Sigma_l in the old seed's weights,
+// and logs the same drift in the new seed's weights as a diagnostic.
+TEST(IDALaggingPolicy, BOTH_DriftUsesEachSeedsOwnWeights)
 {
-  std::vector<std::vector<std::string>> segments[2];
-  for (const unsigned int variant : {0u, 1u})
+  ToySystem system;
+  auto      knobs            = parameters("lag_always");
+  knobs.gmres_tolerance_mode = "fixed";
+  knobs.log_prefix           = log_prefix("drift_seed_weights");
+  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  policy.start();
+  // Constant alpha: theta_D = 0, so the whole pooled factor is the state
+  // part. Segment 1 seeds at y(0); segment 2 lags and carries its factor;
+  // segment 3 seeds again at y(0.2) after the external factorization.
+  for (unsigned int s = 0; s < 5; ++s)
     {
-      ToySystem system;
-      auto      knobs            = parameters("lag_always");
-      knobs.gmres_tolerance_mode = "fixed";
-      knobs.log_prefix = log_prefix("drift_weights_" + std::to_string(variant));
-      Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
-      policy.start();
-      for (unsigned int s = 0; s < 5; ++s)
-        {
-          // Constant alpha: theta_D = 0, so the whole pooled factor is the
-          // state part.
-          if (variant == 1 && s == 3)
-            system.weight_scale = 10.;
-          step(policy, system, .1 * s, 1., true, 1, 1., 1.e-6);
-        }
-      policy.finish();
-      if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
-        segments[variant] = rows(knobs.log_prefix + "_segments.log");
+      if (s == 2)
+        policy.reset_factorization();
+      // IDA's current weights change (a ramp); the drift norm must not.
+      system.weight_scale = s >= 3 ? 10. : 1.;
+      step(policy, system, .1 * s, 1., true, 1, 1., 1.e-6);
     }
-  if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
-    {
-      ASSERT_EQ(segments[0].size(), 5u);
-      ASSERT_EQ(segments[1].size(), 5u);
-      // Column 22 is theta_y. Segments 3-5 (rows 2-4) have a carried factor.
-      // At segment 4 the carried displacement dates from before the weight
-      // change and the current one from after it; a ratio of norms taken
-      // with different weights would differ by the factor 10 there.
-      constexpr unsigned int theta_y = 22;
-      for (const unsigned int row : {2u, 3u, 4u})
-        {
-          const double a = std::stod(segments[0][row][theta_y]);
-          const double b = std::stod(segments[1][row][theta_y]);
-          EXPECT_GT(a, 0.);
-          EXPECT_NEAR(a, b, 1.e-3 * a) << "segment " << row + 1;
-        }
-    }
+  policy.finish();
+
+  // Independent oracle: the toy states are y(t) = vector(1 + t).
+  const auto y     = [&](const double t) { return system.vector(1. + t); };
+  const auto drift = [&](const double t, const double t_seed) {
+    Vector d = y(t);
+    d -= y(t_seed);
+    return d;
+  };
+  const double sigma_1     = system.wrms(drift(.1, 0.), y(0.));
+  const double sigma_3     = system.wrms(drift(.3, .2), y(.2));
+  const double sigma_4     = system.wrms(drift(.4, .2), y(.2));
+  const double sigma_1_cur = system.wrms(drift(.1, 0.), y(.2));
+  if (dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) != 0)
+    return;
+  const auto segments = rows(knobs.log_prefix + "_segments.log");
+  ASSERT_EQ(segments.size(), 5u);
+  enum Column
+  {
+    sigma          = 4,
+    decision       = 6,
+    theta_pred     = 23,
+    sigma_l        = 24,
+    sigma_l_cur    = 25,
+    theta_pred_cur = 26,
+    cross          = 27
+  };
+  const auto value = [&](const unsigned int row, const Column column) {
+    return std::stod(segments[row][column]);
+  };
+  EXPECT_EQ(segments[2][decision], "first");
+  EXPECT_NEAR(value(1, sigma), sigma_1, 1.e-3 * sigma_1);
+  EXPECT_NEAR(value(3, sigma), sigma_3, 1.e-3 * sigma_3);
+  EXPECT_NEAR(value(4, sigma), sigma_4, 1.e-3 * sigma_4);
+
+  // Segment 4: factor from segment 2, measured from the first seed.
+  EXPECT_EQ(segments[3][cross], "1");
+  EXPECT_NEAR(value(3, sigma_l), sigma_1, 1.e-3 * sigma_1);
+  EXPECT_NEAR(value(3, sigma_l_cur), sigma_1_cur, 1.e-3 * sigma_1_cur);
+  EXPECT_GT(std::abs(sigma_1_cur / sigma_1 - 1.), 1.e-2);
+  EXPECT_NEAR(value(3, theta_pred) / value(3, theta_pred_cur),
+              sigma_1_cur / sigma_1,
+              2.e-3 * sigma_1_cur / sigma_1);
+
+  // Segment 5: factor from segment 4, same seed: both versions agree.
+  EXPECT_EQ(segments[4][cross], "0");
+  EXPECT_NEAR(value(4, sigma_l), sigma_3, 1.e-3 * sigma_3);
+  EXPECT_NEAR(value(4, sigma_l_cur), sigma_3, 1.e-3 * sigma_3);
+  EXPECT_NEAR(value(4, theta_pred),
+              value(4, theta_pred_cur),
+              1.e-3 * value(4, theta_pred));
 }
 
 TEST(IDALaggingPolicy, BOTH_AdaptiveWritesOneRowPerSolveAndSegment)

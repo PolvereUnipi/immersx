@@ -35,14 +35,14 @@ namespace ImmersX
    * communicator. Timings are maximized over ranks, so every rank takes the
    * same decisions.
    *
-   * Differences from the driver:
-   * - the forcing term uses IDA's own error weights and recovers IDA's
-   *   linear tolerance eps_L from the tolerance IDA passes and the
-   *   ls_norm_factor, so it does not depend on that factor;
-   * - the state drift ratio Sigma_s / Sigma_l of the prediction is measured
-   *   with IDA's current weights for both displacements. The driver's
-   *   version, with the seed weights of each displacement, is logged next to
-   *   it.
+   * As in the driver, each state drift Sigma = ||y - y_seed||_WRMS is
+   * measured with the weights of its own seed at the final tolerances, so
+   * Sigma_s / Sigma_l compares drifts relative to their linearization points
+   * even when the carried factor comes from an earlier seed.
+   *
+   * Difference from the driver: the forcing term uses IDA's own error weights
+   * and recovers IDA's linear tolerance eps_L from the tolerance IDA passes
+   * and the ls_norm_factor, so it does not depend on that factor.
    */
   template <typename VectorType>
   class IDALaggingPolicy
@@ -71,9 +71,14 @@ namespace ImmersX
       /** dst = J src with the Jacobian built last. */
       Apply apply_jacobian;
       /** Reinitialize the argument and fill it with IDA's current error
-       * weights.
+       * weights. Used by the forcing term.
        */
       std::function<void(VectorType &)> error_weights;
+      /** Reinitialize w and fill it with IDA's error weights at the state y
+       * with the final tolerances, without a tolerance ramp:
+       * w_i = 1 / (rtol |y_i| + atol_i). Used for the seed's drift norm.
+       */
+      std::function<void(const VectorType &y, VectorType &w)> state_weights;
     };
 
     /** How IDA converts its linear tolerance before passing it. */
@@ -138,6 +143,13 @@ namespace ImmersX
     void
     solve(const VectorType &r, VectorType &z, const double tolerance);
 
+    /** The caller replaced the factorization outside the policy, e.g. for an
+     * initial-condition correction. Close the episode; the next Jacobian
+     * evaluation through the policy factorizes again.
+     */
+    void
+    reset_factorization();
+
     /** Close the open segment and episode, and write the summary. The text is
      * appended to the summary, e.g. the IDA statistics.
      */
@@ -163,13 +175,13 @@ namespace ImmersX
     // One segment = the solves between two Jacobian evaluations.
     struct Segment
     {
-      unsigned int id         = 0;
-      double       t          = 0.;
-      double       alpha      = 0.;
-      double       dalpha     = 0.; // |alpha_s - alpha_seed|
-      double       sigma      = 0.; // ||y_s - y_seed||_WRMS, current weights
-      double       sigma_seed = 0.; // the same with the seed's weights
-      double       euclid     = 0.; // ||y_s - y_seed||_2 / ||y_seed||_2
+      unsigned int id      = 0;
+      double       t       = 0.;
+      double       alpha   = 0.;
+      double       dalpha  = 0.; // |alpha_s - alpha_seed|
+      double       sigma   = 0.; // ||y_s - y_seed||_WRMS, seed's weights
+      double       euclid  = 0.; // ||y_s - y_seed||_2 / ||y_seed||_2
+      unsigned int seed_id = 0;  // seed the drift is measured from
       std::string  decision;
       double       m_hat  = 0.; // predicted iterations of a lagged solve
       double       E_hat  = 0.; // predicted extra cost of a lagged solve
@@ -187,9 +199,16 @@ namespace ImmersX
       double       bound        = 0.; // T_F + tau_it when refactorized
       double       r            = 1.; // alpha_s / alpha_seed
       double       theta_D      = 0.; // alpha part of the predicted factor
-      double       theta_y      = 0.; // state part, current weights
-      double       theta_y_seed = 0.; // state part, driver's seed weights
+      double       theta_y      = 0.; // state part of the predicted factor
       double       theta_pred   = std::numeric_limits<double>::quiet_NaN();
+      // Diagnostics, not used by the decision: Sigma_l of the carried factor
+      // in its own seed's weights (used) and in this seed's weights, the
+      // prediction with the latter, and whether the factor comes from an
+      // earlier seed.
+      double sigma_l        = std::numeric_limits<double>::quiet_NaN();
+      double sigma_l_cur    = std::numeric_limits<double>::quiet_NaN();
+      double theta_pred_cur = std::numeric_limits<double>::quiet_NaN();
+      bool   cross_seed     = false;
       // Pool of the lagged solves with m >= 1: sum of log(rm/r0), sum of m.
       double       pool_log = 0.;
       unsigned int pool_m   = 0;
@@ -224,10 +243,13 @@ namespace ImmersX
 
     struct Seed
     {
-      bool       valid   = false;
-      bool       current = false; // factorization of the current operator
-      double     alpha   = 0.;
-      VectorType y, w; // seed state and IDA's weights at the factorization
+      bool         valid   = false;
+      bool         current = false; // factorization of the current operator
+      unsigned int id      = 0;     // = episode id
+      double       alpha   = 0.;
+      // Seed state and its IDA weights at the final tolerances (no ramp):
+      // Sigma is the drift relative to the linearization point.
+      VectorType y, w;
     };
 
     struct Costs
@@ -340,10 +362,12 @@ namespace ImmersX
     Totals      tot;
     // GMRES factor of the last lagged solve with m >= 1; NaN before it.
     double theta_last = std::numeric_limits<double>::quiet_NaN();
-    // Pooled factor of the last segment with lagged iterations, the drift
-    // at which it was measured (r, displacement) and the driver's Sigma.
+    // Pooled factor of the last segment with lagged iterations, the drift at
+    // which it was measured (r, Sigma in its seed's weights) and that seed.
+    // The displacement vector is kept for the diagnostic sigma_l_cur.
     double       theta_pool = std::numeric_limits<double>::quiet_NaN();
-    double       r_last = 1., sigma_last_seed = 0.;
+    double       r_last = 1., sigma_last = 0.;
+    unsigned int seed_last = 0;
     VectorType   displacement_last;
     unsigned int probe_c = 0, probe_b = 1;
 

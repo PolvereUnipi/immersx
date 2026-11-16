@@ -60,7 +60,8 @@ namespace ImmersX
     parameters.validate();
     AssertThrow(operations.build_jacobian && operations.factorize &&
                   operations.apply_factorization && operations.direct_solve &&
-                  operations.apply_jacobian && operations.error_weights,
+                  operations.apply_jacobian && operations.error_weights &&
+                  operations.state_weights,
                 dealii::ExcMessage(
                   "IDALaggingPolicy needs every operation callback."));
   }
@@ -164,10 +165,11 @@ namespace ImmersX
     cost = Costs();
     tot  = Totals();
 
-    theta_last      = std::numeric_limits<double>::quiet_NaN();
-    theta_pool      = std::numeric_limits<double>::quiet_NaN();
-    r_last          = 1.;
-    sigma_last_seed = 0.;
+    theta_last = std::numeric_limits<double>::quiet_NaN();
+    theta_pool = std::numeric_limits<double>::quiet_NaN();
+    r_last     = 1.;
+    sigma_last = 0.;
+    seed_last  = 0;
     // displacement_last is read only once theta_pool is set again.
     probe_c = 0;
     probe_b = parameters.probe_interval_min;
@@ -247,9 +249,10 @@ namespace ImmersX
 
     seed.valid   = true;
     seed.current = true;
+    seed.id      = tot.factorizations;
     seed.alpha   = ns.op_alpha;
     seed.y       = ns.op_y;
-    operations.error_weights(seed.w);
+    operations.state_weights(seed.y, seed.w);
 
     ep         = Episode();
     ep.id      = tot.factorizations;
@@ -296,22 +299,21 @@ namespace ImmersX
         return;
       }
 
-    // Drift of the new operator with respect to the seed, in IDA's current
-    // weights (and in the seed's, as the driver measures it).
-    VectorType w;
-    operations.error_weights(w);
+    // Drift of the new operator with respect to the seed, in the seed's
+    // weights.
     seg.displacement = ns.op_y;
     seg.displacement -= seed.y;
-    seg.dalpha     = std::abs(seg.alpha - seed.alpha);
-    seg.sigma      = wrms(seg.displacement, w);
-    seg.sigma_seed = wrms(seg.displacement, seed.w);
+    seg.seed_id = seed.id;
+    seg.dalpha  = std::abs(seg.alpha - seed.alpha);
+    seg.sigma   = wrms(seg.displacement, seed.w);
     seg.euclid =
       seg.displacement.l2_norm() / std::max(seed.y.l2_norm(), 1e-300);
 
     // Predicted factor: the alpha part of this segment plus the state part
     // of the pooled factor of the last segment with lagged iterations,
-    // scaled by the state drift. Both displacements are measured in the
-    // same (current) weights, so the scaling of the norm cancels.
+    // scaled by the state drift. Sigma_l and Sigma_s are each measured from
+    // their own seed, with that seed's weights: drifts relative to their
+    // linearization points, which do not cancel across seeds.
     seg.r       = seed.alpha != 0. ?
                     seg.alpha / seed.alpha :
                     (seg.alpha == 0. ? 1. : std::numeric_limits<double>::infinity());
@@ -319,12 +321,19 @@ namespace ImmersX
     if (theta_pool > 0.)
       {
         const double state_part = std::max(theta_pool - theta_disk(r_last), 0.);
-        const double sigma_last = wrms(displacement_last, w);
         seg.theta_y =
           sigma_last > 0. ? state_part * seg.sigma / sigma_last : state_part;
-        seg.theta_y_seed = sigma_last_seed > 0. ?
-                             state_part * seg.sigma_seed / sigma_last_seed :
-                             state_part;
+
+        // Diagnostic: the same prediction with Sigma_l measured in this
+        // seed's weights. It differs only when the factor was measured from
+        // an earlier seed.
+        seg.cross_seed  = seed_last != seg.seed_id;
+        seg.sigma_l     = sigma_last;
+        seg.sigma_l_cur = wrms(displacement_last, seed.w);
+        seg.theta_pred_cur =
+          seg.theta_D + (seg.sigma_l_cur > 0. ?
+                           state_part * seg.sigma / seg.sigma_l_cur :
+                           state_part);
       }
     seg.theta_pred = seg.theta_D + seg.theta_y;
     seg.m_hat      = predict_m(eta, seg.theta_pred);
@@ -423,8 +432,9 @@ namespace ImmersX
                      << std::right << std::setw(14) << seg.r << std::setw(14)
                      << seg.theta_D << std::setw(14) << seg.theta_y
                      << std::setw(14) << seg.theta_pred << std::setw(14)
-                     << seg.sigma_seed << std::setw(14) << seg.theta_y_seed
-                     << '\n';
+                     << seg.sigma_l << std::setw(14) << seg.sigma_l_cur
+                     << std::setw(14) << seg.theta_pred_cur << std::setw(6)
+                     << seg.cross_seed << '\n';
       }
   }
 
@@ -651,7 +661,8 @@ namespace ImmersX
                 // prediction.
                 seg.carried       = true;
                 r_last            = seg.r;
-                sigma_last_seed   = seg.sigma_seed;
+                sigma_last        = seg.sigma;
+                seed_last         = seg.seed_id;
                 displacement_last = seg.displacement;
               }
           }
@@ -744,6 +755,21 @@ namespace ImmersX
                  << std::setw(14) << (sys.r0 > 0. ? sys.eta() : 0.)
                  << std::setw(14) << m_hat << std::setw(14) << E_hat
                  << std::setw(14) << sys.eps_L << "  " << action << '\n';
+  }
+
+
+
+  template <typename VectorType>
+  void
+  IDALaggingPolicy<VectorType>::reset_factorization()
+  {
+    if (!pending_refactorization.empty())
+      ++tot.deferred_dropped;
+    pending_refactorization.clear();
+    if (seed.valid)
+      close_episode("external");
+    seed.valid   = false;
+    seed.current = false;
   }
 
 
@@ -871,7 +897,8 @@ namespace ImmersX
                  header);
     log_segments
       << "# dalpha    |alpha_s - alpha_seed|\n"
-      << "# sigma     ||y_s - y_seed||_WRMS with IDA's current weights\n"
+      << "# sigma     ||y_s - y_seed||_WRMS with the seed's IDA weights at the\n"
+      << "#           final tolerances (no tolerance ramp)\n"
       << "# euclid    ||y_s - y_seed||_2 / ||y_seed||_2\n"
       << "# decision  first | direct | lag_always | keep_R1 | probe_R4 |\n"
       << "#           refact_R1 | refact_R2 (deferred R2 of the previous\n"
@@ -884,10 +911,13 @@ namespace ImmersX
       << "#           a rule fired inside the segment (E_s* < bound)\n"
       << "# r         alpha_s / alpha_seed; theta_D = |1-r|/(1+r)\n"
       << "# theta_y   state part: pooled factor minus its alpha part, times\n"
-      << "#           sigma / sigma_l, both with the current weights\n"
+      << "#           sigma / sigma_l\n"
       << "# theta_pred = theta_D + theta_y\n"
-      << "# sigma_seed, theta_y_seed  the same with the seed's weights (the\n"
-      << "#           driver's version, logged only)\n"
+      << "# sigma_l   Sigma of the carried factor, in its own seed's weights\n"
+      << "#           (used by theta_y)\n"
+      << "# sigma_l_cur  the same drift vector in this segment's seed weights\n"
+      << "# theta_pred_cur  theta_pred with sigma_l_cur (diagnostic, unused)\n"
+      << "# cross     1 if the carried factor was measured from an earlier seed\n"
       << "#" << std::setw(5) << "seg" << std::setw(14) << "t" << std::setw(14)
       << "alpha" << std::setw(14) << "dalpha" << std::setw(14) << "sigma"
       << std::setw(14) << "euclid"
@@ -900,7 +930,8 @@ namespace ImmersX
       << "  " << std::left << std::setw(10) << "ended_by" << std::right
       << std::setw(14) << "r" << std::setw(14) << "theta_D" << std::setw(14)
       << "theta_y" << std::setw(14) << "theta_pred" << std::setw(14)
-      << "sigma_seed" << std::setw(14) << "theta_y_seed" << '\n';
+      << "sigma_l" << std::setw(14) << "sigma_l_cur" << std::setw(14)
+      << "theta_pred_cur" << std::setw(6) << "cross" << '\n';
 
     write_header(log_episodes,
                  "Lagging policy: one row per episode (factorization)",

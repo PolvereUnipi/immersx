@@ -21,6 +21,7 @@
 #  include <immersx/compatibility/dealii_9_9/ida.h>
 #endif
 
+#include <immersx/core/ida_lagging_parameters.h>
 #include <immersx/core/ida_tolerance_ramp.h>
 
 #include <algorithm>
@@ -191,10 +192,12 @@ namespace ImmersX
                       dealii::ExcMessage(
                         "IDA linear solver relative tolerances must be in "
                         "(0, 1]."));
+        lagging.validate();
       });
     }
 
     IDALinearSolverControls linear_solver_controls;
+    IDALaggingParameters    lagging;
     IDAToleranceRamp        tolerance_ramp;
     bool                    print_statistics            = false;
     bool                    print_nonlinear_diagnostics = false;
@@ -376,6 +379,7 @@ namespace ImmersX
         "is unchanged.",
         dealii::Patterns::Integer(0));
       prm.leave_subsection();
+      lagging.add_parameters(prm);
       prm.leave_subsection();
     }
 

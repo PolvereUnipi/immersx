@@ -25,6 +25,7 @@
 #include <deal.II/lac/vector_memory.h>
 
 #include <immersx/core/detail/execution_composition.h>
+#include <immersx/core/ida_lagging_policy.templates.h>
 #include <immersx/core/problem_handle.h>
 #include <immersx/core/time_parameters.h>
 
@@ -789,6 +790,7 @@ namespace ImmersX
       finalize();
       pcout << "IDAAdapter: starting DAE solve with " << composition_.n_fields()
             << " semantic field(s)." << std::endl;
+      start_lagging_policy(state);
       dealii::TimerOutput::Scope timer(computing_timer, "Solve DAE");
       try
         {
@@ -800,14 +802,17 @@ namespace ImmersX
             pcout << "IDA nonlinear failure original_exception=" << error.what()
                   << std::endl;
           print_nonlinear_summary("failure");
+          finish_lagging_policy("failure");
           throw;
         }
       catch (...)
         {
           print_nonlinear_summary("failure");
+          finish_lagging_policy("failure");
           throw;
         }
       print_nonlinear_summary("success");
+      finish_lagging_policy("success");
       const auto n_steps = static_cast<unsigned int>(statistics().steps);
       pcout << "IDAAdapter: DAE solve finished after " << n_steps
             << " internal step(s)." << std::endl;
@@ -1599,12 +1604,20 @@ namespace ImmersX
                     << " reason=nonfinite residual" << std::endl;
             throw dealii::RecoverableUserCallbackError();
           }
+        if (lagging_)
+          lagging_->residual(time, state, state_dot);
       };
       ida_->setup_jacobian = [this](const double            time,
                                     const GlobalVectorType &state,
                                     const GlobalVectorType &state_dot,
                                     const double            alpha) {
-        prepare_jacobian(time, state, state_dot, alpha);
+        // Transient setups go through the lagging policy, which builds the
+        // Jacobian and decides when to factorize it. Initial-condition
+        // corrections (alpha = 0) keep the direct path.
+        if (lagging_ && alpha != 0.)
+          lagging_->setup_jacobian(time, state, state_dot, alpha);
+        else
+          prepare_jacobian(time, state, state_dot, alpha);
       };
       ida_->solve_with_jacobian = [this](const GlobalVectorType &rhs,
                                          GlobalVectorType       &dst,
@@ -1619,146 +1632,15 @@ namespace ImmersX
         AssertThrow(current_jacobian_.has_value(),
                     dealii::ExcMessage("IDA requested a solve without a "
                                        "current Jacobian."));
-        if (linear_solver_ == LinearSolver::umfpack ||
-            linear_solver_ == LinearSolver::mumps)
+        if (lagging_ && policy_jacobian_)
           {
-            dealii::TimerOutput::Scope backsolve_timer(computing_timer,
-                                                       "Direct backsolve");
-            AssertThrow(
-              direct_solver_.initialized(),
-              dealii::ExcMessage(
-                "IDA requested a direct solve without a factorization."));
-            GlobalVectorType original_rhs(rhs);
-            original_rhs.compress(dealii::VectorOperation::insert);
-            const auto backsolve = [this](const GlobalVectorType &input,
-                                          GlobalVectorType       &output) {
-              if (condensation_)
-                {
-                  std::vector<FieldVectorType> kinematic(
-                    condensation_->n_pairs());
-                  FieldVectorType kinematic_rhs;
-                  for (std::size_t p = 0; p < kinematic.size(); ++p)
-                    {
-                      condensation_->kinematic_rhs(input, p, kinematic_rhs);
-                      kinematic_solvers_[p]->solve(kinematic[p], kinematic_rhs);
-                      condensation_->finish_kinematic_solution(input,
-                                                               p,
-                                                               kinematic[p]);
-                    }
-                  FieldVectorType reduced_rhs, reduced_solution;
-                  condensation_->reduced_rhs(input, kinematic, reduced_rhs);
-                  direct_solver_.solve(reduced_solution, reduced_rhs);
-                  condensation_->expand(reduced_solution, kinematic, output);
-                }
-              else
-                {
-                  auto source = composition_.pack(input);
-                  source.compress(dealii::VectorOperation::insert);
-                  FieldVectorType solution;
-                  direct_solver_.solve(solution, source);
-                  composition_.unpack(solution, output);
-                  output.compress(dealii::VectorOperation::insert);
-                }
-            };
-            backsolve(original_rhs, dst);
-            if (linear_solver_ == LinearSolver::mumps)
-              {
-                dealii::TimerOutput::Scope refinement_timer(
-                  computing_timer, "MUMPS iterative refinement");
-                // MUMPS disables its internal refinement for distributed
-                // right-hand sides. Reuse the factorization for at most three
-                // corrections, measuring each defect with the retained Jacobian
-                // action.
-                GlobalVectorType defect;
-                composition_.reinit(defect);
-                const auto  &controls = ida_parameters_.linear_solver_controls;
-                const double relative_target =
-                  controls.mumps_relative_tolerance;
-                const unsigned int max_refinements =
-                  controls.mumps_maximum_corrections;
-                const double        rhs_norm    = original_rhs.l2_norm();
-                double              defect_norm = 0.;
-                unsigned int        refinement  = 0;
-                std::vector<double> defect_history(max_refinements + 1);
-                for (;; ++refinement)
-                  {
-                    current_jacobian_->vmult(defect, dst);
-                    defect -= original_rhs;
-                    defect_norm                = defect.l2_norm();
-                    defect_history[refinement] = defect_norm;
-                    if (!std::isfinite(defect_norm) ||
-                        defect_norm <= relative_target * rhs_norm ||
-                        refinement == max_refinements)
-                      break;
-                    GlobalVectorType correction;
-                    composition_.reinit(correction);
-                    backsolve(defect, correction);
-                    dst -= correction;
-                    dst.compress(dealii::VectorOperation::insert);
-                  }
-                unsigned int krylov_corrections = 0;
-                if (std::isfinite(defect_norm) &&
-                    defect_norm > relative_target * rhs_norm &&
-                    controls.mumps_maximum_krylov_corrections > 0)
-                  {
-                    krylov_corrections =
-                      detail::mumps_krylov_refinement<GlobalVectorType>(
-                        *current_jacobian_,
-                        backsolve,
-                        original_rhs,
-                        dst,
-                        controls.mumps_maximum_krylov_corrections,
-                        relative_target * rhs_norm);
-                    current_jacobian_->vmult(defect, dst);
-                    defect -= original_rhs;
-                    defect_norm = defect.l2_norm();
-                    std::ostringstream recovery_message;
-                    recovery_message
-                      << "IDAAdapter: MUMPS Krylov recovery used "
-                      << krylov_corrections << " iteration(s), true residual "
-                      << std::scientific << std::setprecision(17) << defect_norm
-                      << ", target " << relative_target * rhs_norm;
-                    pcout << recovery_message.str() << std::endl;
-                  }
-                if (ida_parameters_.print_nonlinear_diagnostics)
-                  {
-                    print_nonlinear_linear_defect(original_rhs, defect);
-                    print_nonlinear_correction(dst);
-                  }
-                // Some supported deal.II MUMPS wrappers do not report failed
-                // factorizations. Do not let a zero correction freeze the DAE.
-                if (!(std::isfinite(defect_norm) &&
-                      defect_norm <= relative_target * rhs_norm))
-                  {
-                    std::ostringstream message;
-                    message << std::scientific << std::setprecision(17)
-                            << "MUMPS backsolve failed the retained-Jacobian "
-                               "residual check. RHS L2 norm = "
-                            << rhs_norm << ", defect L2 norm = " << defect_norm
-                            << ", required defect L2 norm <= "
-                            << relative_target * rhs_norm
-                            << ", relative target = " << relative_target
-                            << ", relative defect = ";
-                    if (rhs_norm > 0.)
-                      message << defect_norm / rhs_norm;
-                    else
-                      message << "undefined";
-                    message << ", correction solves = " << refinement
-                            << ", Krylov correction iterations = "
-                            << krylov_corrections << ", defect L2 history = [";
-                    for (unsigned int i = 0; i <= refinement; ++i)
-                      {
-                        if (i != 0)
-                          message << ", ";
-                        message << defect_history[i];
-                      }
-                    message
-                      << "]. Inspect native diagnostics and the workspace "
-                         "relaxation.";
-                    throw detail::MumpsBacksolveResidualError(message.str());
-                  }
-              }
+            dealii::TimerOutput::Scope policy_timer(computing_timer,
+                                                    "Lagging policy");
+            lagging_->solve(rhs, dst, tolerance);
           }
+        else if (linear_solver_ == LinearSolver::umfpack ||
+                 linear_solver_ == LinearSolver::mumps)
+          direct_solve(rhs, dst);
         else if (solve_)
           {
             pcout << "IDAAdapter: invoking the configured linear solver."
@@ -2175,15 +2057,7 @@ namespace ImmersX
           return;
         }
       GlobalVectorType weights;
-      weights.reinit(correction);
-      auto view = Compatibility::SUNDIALS::internal::make_nvector_view(
-        weights
-#  if DEAL_II_SUNDIALS_VERSION_GTE(6, 0, 0)
-        ,
-        ida_->get_sun_context()
-#  endif
-      );
-      const int status = IDAGetErrWeights(ida_->get_ida_memory(), view);
+      const int status = read_error_weights(weights, &correction);
       if (status < 0)
         {
           pcout << "IDA nonlinear correction solve=" << linear_solves_
@@ -2393,6 +2267,350 @@ namespace ImmersX
         }
     }
 
+    /** Read IDA's current error weights; returns IDAGetErrWeights' status.
+     * A restart may resize IDA's vectors without changing field
+     * registration: pass a vector of IDA's current layout as @p layout to
+     * size the weights like it instead of like the registered fields.
+     */
+    int
+    read_error_weights(GlobalVectorType       &weights,
+                       const GlobalVectorType *layout = nullptr) const
+    {
+      if (layout != nullptr)
+        weights.reinit(*layout);
+      else
+        composition_.reinit(weights);
+      auto view = Compatibility::SUNDIALS::internal::make_nvector_view(
+        weights
+#  if DEAL_II_SUNDIALS_VERSION_GTE(6, 0, 0)
+        ,
+        ida_->get_sun_context()
+#  endif
+      );
+      return IDAGetErrWeights(ida_->get_ida_memory(), view);
+    }
+
+    /** output = M^{-1} input with the current direct factorization,
+     * including the second-order condensation.
+     */
+    void
+    apply_direct_factorization(const GlobalVectorType &input,
+                               GlobalVectorType       &output)
+    {
+      if (condensation_)
+        {
+          std::vector<FieldVectorType> kinematic(condensation_->n_pairs());
+          FieldVectorType              kinematic_rhs;
+          for (std::size_t p = 0; p < kinematic.size(); ++p)
+            {
+              condensation_->kinematic_rhs(input, p, kinematic_rhs);
+              kinematic_solvers_[p]->solve(kinematic[p], kinematic_rhs);
+              condensation_->finish_kinematic_solution(input, p, kinematic[p]);
+            }
+          FieldVectorType reduced_rhs, reduced_solution;
+          condensation_->reduced_rhs(input, kinematic, reduced_rhs);
+          direct_solver_.solve(reduced_solution, reduced_rhs);
+          condensation_->expand(reduced_solution, kinematic, output);
+        }
+      else
+        {
+          auto source = composition_.pack(input);
+          source.compress(dealii::VectorOperation::insert);
+          FieldVectorType solution;
+          direct_solver_.solve(solution, source);
+          composition_.unpack(solution, output);
+          output.compress(dealii::VectorOperation::insert);
+        }
+    }
+
+    /** Solve with a factorization of the current Jacobian, then check and
+     * correct the result with the retained Jacobian action (MUMPS).
+     */
+    void
+    direct_solve(const GlobalVectorType &rhs, GlobalVectorType &dst)
+    {
+      dealii::TimerOutput::Scope backsolve_timer(computing_timer,
+                                                 "Direct backsolve");
+      AssertThrow(direct_solver_.initialized(),
+                  dealii::ExcMessage(
+                    "IDA requested a direct solve without a factorization."));
+      GlobalVectorType original_rhs(rhs);
+      original_rhs.compress(dealii::VectorOperation::insert);
+      const auto backsolve = [this](const GlobalVectorType &input,
+                                    GlobalVectorType       &output) {
+        apply_direct_factorization(input, output);
+      };
+      backsolve(original_rhs, dst);
+      if (linear_solver_ == LinearSolver::mumps)
+        {
+          dealii::TimerOutput::Scope refinement_timer(
+            computing_timer, "MUMPS iterative refinement");
+          // MUMPS disables its internal refinement for distributed
+          // right-hand sides. Reuse the factorization for at most three
+          // corrections, measuring each defect with the retained Jacobian
+          // action.
+          GlobalVectorType defect;
+          composition_.reinit(defect);
+          const auto  &controls        = ida_parameters_.linear_solver_controls;
+          const double relative_target = controls.mumps_relative_tolerance;
+          const unsigned int max_refinements =
+            controls.mumps_maximum_corrections;
+          const double        rhs_norm    = original_rhs.l2_norm();
+          double              defect_norm = 0.;
+          unsigned int        refinement  = 0;
+          std::vector<double> defect_history(max_refinements + 1);
+          for (;; ++refinement)
+            {
+              current_jacobian_->vmult(defect, dst);
+              defect -= original_rhs;
+              defect_norm                = defect.l2_norm();
+              defect_history[refinement] = defect_norm;
+              if (!std::isfinite(defect_norm) ||
+                  defect_norm <= relative_target * rhs_norm ||
+                  refinement == max_refinements)
+                break;
+              GlobalVectorType correction;
+              composition_.reinit(correction);
+              backsolve(defect, correction);
+              dst -= correction;
+              dst.compress(dealii::VectorOperation::insert);
+            }
+          unsigned int krylov_corrections = 0;
+          if (std::isfinite(defect_norm) &&
+              defect_norm > relative_target * rhs_norm &&
+              controls.mumps_maximum_krylov_corrections > 0)
+            {
+              krylov_corrections =
+                detail::mumps_krylov_refinement<GlobalVectorType>(
+                  *current_jacobian_,
+                  backsolve,
+                  original_rhs,
+                  dst,
+                  controls.mumps_maximum_krylov_corrections,
+                  relative_target * rhs_norm);
+              current_jacobian_->vmult(defect, dst);
+              defect -= original_rhs;
+              defect_norm = defect.l2_norm();
+              std::ostringstream recovery_message;
+              recovery_message
+                << "IDAAdapter: MUMPS Krylov recovery used "
+                << krylov_corrections << " iteration(s), true residual "
+                << std::scientific << std::setprecision(17) << defect_norm
+                << ", target " << relative_target * rhs_norm;
+              pcout << recovery_message.str() << std::endl;
+            }
+          if (ida_parameters_.print_nonlinear_diagnostics)
+            {
+              print_nonlinear_linear_defect(original_rhs, defect);
+              print_nonlinear_correction(dst);
+            }
+          // Some supported deal.II MUMPS wrappers do not report failed
+          // factorizations. Do not let a zero correction freeze the DAE.
+          if (!(std::isfinite(defect_norm) &&
+                defect_norm <= relative_target * rhs_norm))
+            {
+              std::ostringstream message;
+              message << std::scientific << std::setprecision(17)
+                      << "MUMPS backsolve failed the retained-Jacobian "
+                         "residual check. RHS L2 norm = "
+                      << rhs_norm << ", defect L2 norm = " << defect_norm
+                      << ", required defect L2 norm <= "
+                      << relative_target * rhs_norm
+                      << ", relative target = " << relative_target
+                      << ", relative defect = ";
+              if (rhs_norm > 0.)
+                message << defect_norm / rhs_norm;
+              else
+                message << "undefined";
+              message << ", correction solves = " << refinement
+                      << ", Krylov correction iterations = "
+                      << krylov_corrections << ", defect L2 history = [";
+              for (unsigned int i = 0; i <= refinement; ++i)
+                {
+                  if (i != 0)
+                    message << ", ";
+                  message << defect_history[i];
+                }
+              message << "]. Inspect native diagnostics and the workspace "
+                         "relaxation.";
+              throw detail::MumpsBacksolveResidualError(message.str());
+            }
+        }
+    }
+
+    /** Materialize the Jacobian of a snapshot and factorize it. */
+    void
+    factorize_jacobian(typename Composition::Snapshot &snapshot,
+                       const double                    time,
+                       const double                    alpha)
+    {
+      typename Composition::BlockMatrixType blocks;
+      {
+        dealii::TimerOutput::Scope block_timer(computing_timer,
+                                               "Materialize Jacobian");
+        composition_.block_matrix(blocks,
+                                  snapshot.state_storage,
+                                  &snapshot.derivative_storage,
+                                  alpha,
+                                  time,
+                                  &snapshot.linearization);
+      }
+      factorize_blocks(blocks);
+    }
+
+    /** Factorize materialized Jacobian blocks, after the second-order
+     * condensation when it applies.
+     */
+    void
+    factorize_blocks(const typename Composition::BlockMatrixType &blocks)
+    {
+      dealii::TimerOutput::Scope direct_timer(computing_timer,
+                                              "Materialize Jacobian");
+      condensation_ = composition_.second_order_condensation(blocks);
+      std::shared_ptr<MatrixType> monolithic;
+      if (!condensation_)
+        {
+          monolithic = std::make_shared<MatrixType>();
+          composition_.monolithic_matrix(blocks, *monolithic);
+        }
+      direct_timer.stop();
+      dealii::TimerOutput::Scope factor_timer(computing_timer,
+                                              "Factorize Jacobian");
+      const std::string          solver_name =
+        linear_solver_ == LinearSolver::umfpack ? "UMFPACK" : "MUMPS";
+      if (condensation_)
+        {
+          prepare_kinematic_solvers(condensation_, linear_solver_);
+          const auto &reduced = condensation_->reduced_matrix();
+          direct_solver_.factorize(linear_solver_,
+                                   reduced,
+                                   composition_.communicator(),
+                                   mumps_workspace_relaxation_,
+                                   mumps_memory_limit_mb_,
+                                   mumps_output_details_);
+          pcout << "IDAAdapter: " << solver_name << " factorized "
+                << reduced.m() << " rows after second-order condensation ("
+                << blocks.m() << " coupled), " << direct_solver_.n_entries()
+                << " matrix entries." << std::endl;
+        }
+      else
+        {
+          direct_solver_.factorize(linear_solver_,
+                                   *monolithic,
+                                   composition_.communicator(),
+                                   mumps_workspace_relaxation_,
+                                   mumps_memory_limit_mb_,
+                                   mumps_output_details_);
+          pcout << "IDAAdapter: " << solver_name << " factorized "
+                << monolithic->m() << " rows, " << direct_solver_.n_entries()
+                << " matrix entries." << std::endl;
+        }
+    }
+
+    /** Create and start the lagging policy if it is enabled. */
+    void
+    start_lagging_policy(const GlobalVectorType &state)
+    {
+      lagging_.reset();
+      lagging_snapshot_.reset();
+      policy_jacobian_ = false;
+      if (!ida_parameters_.lagging.enabled())
+        return;
+      AssertThrow(linear_solver_ == LinearSolver::mumps,
+                  dealii::ExcMessage(
+                    "IDA parameters/Linear solver/Lagging policy needs the "
+                    "mumps linear solver."));
+      using Policy = IDALaggingPolicy<GlobalVectorType>;
+      typename Policy::Operations operations;
+      operations.build_jacobian = [this](const double            time,
+                                         const GlobalVectorType &state,
+                                         const GlobalVectorType &state_dot,
+                                         const double            alpha) {
+        prepare_jacobian(time, state, state_dot, alpha);
+        policy_jacobian_ = true;
+      };
+      operations.factorize = [this]() {
+        AssertThrow(lagging_snapshot_, dealii::ExcInternalError());
+        factorize_jacobian(*lagging_snapshot_, lagging_time_, lagging_alpha_);
+      };
+      operations.apply_factorization = [this](GlobalVectorType       &dst,
+                                              const GlobalVectorType &src) {
+        apply_direct_factorization(src, dst);
+      };
+      operations.direct_solve = [this](GlobalVectorType       &dst,
+                                       const GlobalVectorType &src) {
+        direct_solve(src, dst);
+      };
+      operations.apply_jacobian = [this](GlobalVectorType       &dst,
+                                         const GlobalVectorType &src) {
+        current_jacobian_->vmult(dst, src);
+      };
+      operations.error_weights = [this](GlobalVectorType &weights) {
+        check_ida(read_error_weights(weights));
+      };
+      // IDA's weights at a given state with the final tolerances, without
+      // ramp factors. absolute_tolerances_ holds the per-field values when
+      // the adapter owns the tolerances; otherwise IDA uses the scalar one.
+      operations.state_weights = [this](const GlobalVectorType &y,
+                                        GlobalVectorType       &weights) {
+        composition_.reinit(weights);
+        const auto &data  = additional_data();
+        const bool  local = absolute_tolerances_.size() == y.size();
+        for (unsigned int b = 0; b < weights.n_blocks(); ++b)
+          for (const auto i : weights.block(b).locally_owned_elements())
+            weights.block(b)[i] =
+              1. / (data.relative_tolerance * std::abs(y.block(b)[i]) +
+                    (local ? absolute_tolerances_.block(b)[i] :
+                             data.absolute_tolerance));
+        weights.compress(dealii::VectorOperation::insert);
+      };
+
+      const auto                   &data = additional_data();
+      typename Policy::IDATolerance tolerance;
+      tolerance.ls_norm_factor = data.ls_norm_factor;
+      // IDA's Newton test constant is the convergence coefficient while it
+      // integrates, so its linear tolerance is eplifac * epcon.
+      tolerance.expected_linear_tolerance =
+        data.linear_tolerance_factor * data.nonlinear_convergence_coefficient;
+      std::ostringstream header;
+      header << "IDAAdapter: unknowns N " << state.size()
+             << ", linear solver mumps\n"
+             << "IDA: rtol " << data.relative_tolerance << ", atol "
+             << data.absolute_tolerance << ", max order " << data.maximum_order
+             << ", Cj setup difference factor " << data.delta_cj_lsetup
+             << ", ls_norm_factor " << data.ls_norm_factor
+             << ", Linear tolerance factor " << data.linear_tolerance_factor
+             << ", Convergence coefficient "
+             << data.nonlinear_convergence_coefficient << ", t in ["
+             << data.initial_time << ", " << data.final_time << "]";
+      lagging_ = std::make_unique<Policy>(ida_parameters_.lagging,
+                                          tolerance,
+                                          composition_.communicator(),
+                                          std::move(operations));
+      lagging_->start(header.str());
+    }
+
+    /** Write the policy summary with IDA's statistics and drop the policy. */
+    void
+    finish_lagging_policy(const char *outcome)
+    {
+      if (!lagging_)
+        return;
+      const auto         info = statistics();
+      std::ostringstream text;
+      text << "\n# IDA statistics (" << outcome << ")\n"
+           << "steps                 " << info.steps << '\n'
+           << "nonlinear_iterations  " << info.nonlinear_iterations << '\n'
+           << "jacobian_setups       " << info.jacobian_setups << '\n'
+           << "linear_solves         " << info.linear_solves << '\n'
+           << "error_test_failures   " << info.error_test_failures << '\n'
+           << "convergence_failures  " << info.convergence_failures << '\n';
+      lagging_->finish(text.str());
+      lagging_.reset();
+      lagging_snapshot_.reset();
+      policy_jacobian_ = false;
+    }
+
     void
     prepare_jacobian(const double            time,
                      const GlobalVectorType &state,
@@ -2469,9 +2687,14 @@ namespace ImmersX
       current_solver_is_flexible_ = false;
       const bool direct_solver    = linear_solver_ == LinearSolver::umfpack ||
                                  linear_solver_ == LinearSolver::mumps;
+      // The lagging policy factorizes a transient Jacobian only when it
+      // decides to, and materializes it then.
+      const bool lagged_setup =
+        direct_solver && lagging_ && !steady_setup && alpha != 0.;
       typename Composition::BlockMatrixType blocks;
-      if (direct_solver || linear_solver_ == LinearSolver::mumps_blr_fgmres ||
-          function_scaling != nullptr)
+      if (!lagged_setup &&
+          (direct_solver || linear_solver_ == LinearSolver::mumps_blr_fgmres ||
+           function_scaling != nullptr))
         {
           dealii::TimerOutput::Scope block_timer(computing_timer,
                                                  "Materialize Jacobian");
@@ -2488,47 +2711,23 @@ namespace ImmersX
         }
       if (direct_solver)
         {
-          dealii::TimerOutput::Scope direct_timer(computing_timer,
-                                                  "Materialize Jacobian");
-          condensation_ = composition_.second_order_condensation(blocks);
-          std::shared_ptr<MatrixType> monolithic;
-          if (!condensation_)
+          if (lagged_setup)
             {
-              monolithic = std::make_shared<MatrixType>();
-              composition_.monolithic_matrix(blocks, *monolithic);
-            }
-          direct_timer.stop();
-          dealii::TimerOutput::Scope factor_timer(computing_timer,
-                                                  "Factorize Jacobian");
-          const std::string          solver_name =
-            linear_solver_ == LinearSolver::umfpack ? "UMFPACK" : "MUMPS";
-          if (condensation_)
-            {
-              prepare_kinematic_solvers(condensation_, linear_solver_);
-              const auto &reduced = condensation_->reduced_matrix();
-              direct_solver_.factorize(linear_solver_,
-                                       reduced,
-                                       composition_.communicator(),
-                                       mumps_workspace_relaxation_,
-                                       mumps_memory_limit_mb_,
-                                       mumps_output_details_);
-              pcout << "IDAAdapter: " << solver_name << " factorized "
-                    << reduced.m() << " rows after second-order condensation ("
-                    << blocks.m() << " coupled), " << direct_solver_.n_entries()
-                    << " matrix entries." << std::endl;
+              // The lagging policy factorizes this Jacobian only when it
+              // decides to. Lagged GMRES solves use the matrix-free action.
+              lagging_snapshot_ = snapshot;
+              lagging_time_     = time;
+              lagging_alpha_    = alpha;
             }
           else
             {
-              direct_solver_.factorize(linear_solver_,
-                                       *monolithic,
-                                       composition_.communicator(),
-                                       mumps_workspace_relaxation_,
-                                       mumps_memory_limit_mb_,
-                                       mumps_output_details_);
-              pcout << "IDAAdapter: " << solver_name << " factorized "
-                    << monolithic->m() << " rows, "
-                    << direct_solver_.n_entries() << " matrix entries."
-                    << std::endl;
+              factorize_blocks(blocks);
+              if (lagging_)
+                {
+                  // The policy's factorization is gone.
+                  policy_jacobian_ = false;
+                  lagging_->reset_factorization();
+                }
             }
         }
       else if (!solve_)
@@ -2784,6 +2983,13 @@ namespace ImmersX
     bool                                connected_                     = false;
     bool                                include_schur_primal_coupling_ = false;
     unsigned int                        schur_materialization_limit_   = 0;
+    // Lagging policy, only while solve() runs with the policy enabled. The
+    // snapshot of the last Jacobian it built waits for its factorization.
+    std::unique_ptr<IDALaggingPolicy<GlobalVectorType>> lagging_;
+    std::shared_ptr<typename Composition::Snapshot>     lagging_snapshot_;
+    double lagging_time_ = 0., lagging_alpha_ = 0.;
+    // Whether the current Jacobian was built through the policy.
+    bool policy_jacobian_ = false;
   };
 } // namespace ImmersX
 #endif
