@@ -1614,6 +1614,8 @@ namespace ImmersX
         // Transient setups go through the lagging policy, which builds the
         // Jacobian and decides when to factorize it. Initial-condition
         // corrections (alpha = 0) keep the direct path.
+        if (ida_parameters_.print_nonlinear_diagnostics)
+          print_ida_trace("setup", alpha);
         if (lagging_ && alpha != 0.)
           lagging_->setup_jacobian(time, state, state_dot, alpha);
         else
@@ -1627,6 +1629,8 @@ namespace ImmersX
           pcout << "IDA nonlinear linear begin solve=" << linear_solves_
                 << " t=" << diagnostic_time_
                 << " requested_tolerance=" << tolerance << std::endl;
+        if (ida_parameters_.print_nonlinear_diagnostics)
+          print_ida_trace("solve", 0.);
         solved_since_residual_ = true;
         dealii::TimerOutput::Scope timer(computing_timer, "Linear solve");
         AssertThrow(current_jacobian_.has_value(),
@@ -1637,6 +1641,8 @@ namespace ImmersX
             dealii::TimerOutput::Scope policy_timer(computing_timer,
                                                     "Lagging policy");
             lagging_->solve(rhs, dst, tolerance);
+            if (ida_parameters_.print_nonlinear_diagnostics)
+              print_policy_solve_check(rhs, dst, tolerance);
           }
         else if (linear_solver_ == LinearSolver::umfpack ||
                  linear_solver_ == LinearSolver::mumps)
@@ -2095,6 +2101,131 @@ namespace ImmersX
            << " t=" << diagnostic_time_ << " field=all wrms="
            << (correction.size() ? std::sqrt(total / correction.size()) : 0.);
       pcout << line.str() << std::endl;
+    }
+
+    /** IDA's step state and counters at a setup or linear solve callback,
+     * enough to tell afterwards why IDA set up a Jacobian or changed the
+     * step: tn is the last accepted time, hh the step being attempted,
+     * nnf the nonlinear solver failures (including those recovered by a
+     * retry with a fresh Jacobian), ncfn the steps failed by the nonlinear
+     * solver, netf the steps failed by the error test.
+     */
+    void
+    print_ida_trace(const char *event, const double alpha) const
+    {
+      if (!ida_ || !ida_->get_ida_memory())
+        return;
+      auto     memory = ida_->get_ida_memory();
+      long int nst = 0, nni = 0, nnf = 0, ncfn = 0, netf = 0, nsetups = 0;
+      int      order = 0;
+      double   tn = 0., hh = 0., cj = 0.;
+      IDAGetNumSteps(memory, &nst);
+      IDAGetNumNonlinSolvIters(memory, &nni);
+      IDAGetNumNonlinSolvConvFails(memory, &nnf);
+      IDAGetNumStepSolveFails(memory, &ncfn);
+      IDAGetNumErrTestFails(memory, &netf);
+      IDAGetNumLinSolvSetups(memory, &nsetups);
+      IDAGetCurrentOrder(memory, &order);
+      IDAGetCurrentTime(memory, &tn);
+      IDAGetCurrentStep(memory, &hh);
+      IDAGetCurrentCj(memory, &cj);
+      std::ostringstream line;
+      line << std::scientific << std::setprecision(12)
+           << "IDA trace event=" << event << " solve=" << linear_solves_
+           << " nst=" << nst << " tn=" << tn << " hh=" << hh << " k=" << order
+           << " cj=" << cj << " alpha=" << alpha << " nni=" << nni
+           << " nnf=" << nnf << " ncfn=" << ncfn << " netf=" << netf
+           << " nsetups=" << nsetups;
+      pcout << line.str() << std::endl;
+    }
+
+    /** What IDA's tests see of a policy solve z of J z = b. Per field and in
+     * total: the 2-norms of b and of the defect d = J z - b (the policy's
+     * GMRES target is a relative 2-norm reduction of d), the WRMS norms
+     * with IDA's weights of M^{-1} d and M^{-1} b (IDA's linear test,
+     * ||M^{-1} d||_WRMS <= eps_L, M the factorization the policy holds), and
+     * of z (IDA's Newton test uses this norm of the correction). Costs one
+     * Jacobian product and two backsolves, so it runs only with
+     * "Print nonlinear diagnostics".
+     */
+    void
+    print_policy_solve_check(const GlobalVectorType &rhs,
+                             const GlobalVectorType &correction,
+                             const double            tolerance)
+    {
+      GlobalVectorType weights, b, defect, pre_defect, pre_rhs;
+      if (read_error_weights(weights) < 0)
+        return;
+      composition_.reinit(b);
+      composition_.reinit(defect);
+      composition_.reinit(pre_defect);
+      composition_.reinit(pre_rhs);
+      b = rhs;
+      b.compress(dealii::VectorOperation::insert);
+      current_jacobian_->vmult(defect, correction);
+      defect -= b;
+      apply_direct_factorization(defect, pre_defect);
+      apply_direct_factorization(b, pre_rhs);
+
+      const auto communicator = composition_.communicator();
+      // Sums of squares over a field: b, d, W M^{-1} d, W M^{-1} b, W z.
+      const auto sums = [&](const FieldId id) {
+        std::array<double, 5> s{};
+        const auto           &w  = composition_.field(weights, id);
+        const auto           &vb = composition_.field(b, id);
+        const auto           &vd = composition_.field(defect, id);
+        const auto           &pd = composition_.field(pre_defect, id);
+        const auto           &pb = composition_.field(pre_rhs, id);
+        const auto           &z  = composition_.field(correction, id);
+        for (const auto i : vb.locally_owned_elements())
+          {
+            s[0] += vb[i] * vb[i];
+            s[1] += vd[i] * vd[i];
+            s[2] += std::pow(w[i] * pd[i], 2);
+            s[3] += std::pow(w[i] * pb[i], 2);
+            s[4] += std::pow(w[i] * z[i], 2);
+          }
+        for (auto &v : s)
+          v = dealii::Utilities::MPI::sum(v, communicator);
+        return std::make_pair(s, composition_.field(b, id).size());
+      };
+      const auto print = [&](const std::string           &field,
+                             const std::array<double, 5> &s,
+                             const double                 n) {
+        std::ostringstream line;
+        line << std::scientific << std::setprecision(6)
+             << "IDA policy check solve=" << linear_solves_
+             << " t=" << diagnostic_time_ << " field=" << field
+             << " b_l2=" << std::sqrt(s[0]) << " d_l2=" << std::sqrt(s[1])
+             << " d_rel=" << (s[0] > 0. ? std::sqrt(s[1] / s[0]) : 0.)
+             << " Md_wrms=" << std::sqrt(s[2] / n)
+             << " Mb_wrms=" << std::sqrt(s[3] / n)
+             << " z_wrms=" << std::sqrt(s[4] / n);
+        return line.str();
+      };
+
+      std::array<double, 5> total{};
+      for (std::size_t i = 0; i < composition_.n_fields(); ++i)
+        {
+          const FieldId id(i);
+          const auto [s, n] = sums(id);
+          for (unsigned int k = 0; k < total.size(); ++k)
+            total[k] += s[k];
+          pcout << print(std::to_string(i) + " name=\"" +
+                           composition_.state_layout().field(id).name + "\"",
+                         s,
+                         std::max<double>(n, 1.))
+                << std::endl;
+        }
+      const double N      = static_cast<double>(b.size());
+      const double nrmfac = additional_data().ls_norm_factor > 0. ?
+                              additional_data().ls_norm_factor :
+                              std::sqrt(N);
+      const double eps_L =
+        tolerance * weights.l2_norm() / std::sqrt(N) / nrmfac;
+      pcout << print("all", total, N) << std::scientific << std::setprecision(6)
+            << " eps_L=" << eps_L
+            << " ida_test=" << std::sqrt(total[2] / N) / eps_L << std::endl;
     }
 
     void
