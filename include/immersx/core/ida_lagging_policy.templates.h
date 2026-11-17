@@ -550,11 +550,14 @@ namespace ImmersX
     GmresResult res;
     res.target = sys.target;
 
-    // ida_forcing, ida_left with eta >= 1: no iteration; the correction is
-    // M^{-1} b, as IDA does when its Krylov solver needs no iteration.
+    // ida_forcing, ida_left with eta >= 1: IDA's test already holds at
+    // x = 0, and x = 0 is returned, as SUNDIALS' SPGMR does. M is lagged
+    // here (a current factorization takes the direct path), so M^{-1} b is
+    // one Richardson step and need not improve on 0: on the coupled app it
+    // missed IDA's test by 10-89x after a change of alpha.
     if (sys.has_Mb && sys.r0 <= sys.target)
       {
-        x      = sys.Mb;
+        x      = 0.;
         res.r0 = res.rm = sys.r0;
         return res;
       }

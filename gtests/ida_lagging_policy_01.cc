@@ -570,9 +570,10 @@ TEST(IDALaggingPolicy, BOTH_LeftModeMeetsIDAsLinearTest)
   EXPECT_NEAR(totals.eps_ratio_min, 1., 1.e-12);
 }
 
-// ida_forcing and ida_left with eta >= 1: M^{-1} b already passes IDA's
-// test and is the correction, without GMRES iterations.
-TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
+// ida_forcing and ida_left with eta >= 1, i.e. IDA's test already holds at
+// x = 0: a current factorization still returns M^{-1} b = J^{-1} b; a lagged
+// one returns 0, as SUNDIALS' SPGMR does, without GMRES iterations.
+TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneReturnsZeroWhenLagged)
 {
   for (const std::string mode : {"ida_forcing", "ida_left"})
     {
@@ -581,21 +582,35 @@ TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
       knobs.gmres_tolerance_mode = mode;
       Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
       policy.start();
-      step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
       const auto r = system.vector(-1.);
-      for (unsigned int s = 1; s < 4; ++s)
+      for (unsigned int s = 0; s < 4; ++s)
         {
           const auto y = system.vector(1. + .1 * s);
           system.state = y;
           policy.residual(.1 * s, y, y);
           policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
-          Vector z(r), Mr(r);
-          system.direct->solve(Mr, r);
-          policy.solve(r, z, 1.e8);
-          z -= Mr;
-          EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm()) << mode;
+          // At s = 0 the second solve has a factorization (M = J) when it
+          // computes M^{-1} b.
+          for (unsigned int k = 0; k < (s == 0 ? 2u : 1u); ++k)
+            {
+              Vector z(r);
+              policy.solve(r, z, 1.e8);
+              if (s == 0)
+                {
+                  // The toy system holds a factorization only after the
+                  // policy's first one.
+                  Vector Mr(r);
+                  system.direct->solve(Mr, r);
+                  z -= Mr;
+                  EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm()) << mode;
+                }
+              else
+                EXPECT_EQ(z.l2_norm(), 0.) << mode;
+            }
         }
       policy.finish();
+      EXPECT_EQ(policy.totals().factorizations, 1u) << mode;
+      EXPECT_EQ(policy.totals().direct_solves, 2u) << mode;
       EXPECT_EQ(policy.totals().lagged_solves, 3u) << mode;
       EXPECT_EQ(policy.totals().gmres_iterations, 0u) << mode;
     }
