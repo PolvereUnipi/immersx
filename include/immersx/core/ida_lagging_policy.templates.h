@@ -10,6 +10,7 @@
 
 #include <deal.II/base/mpi.h>
 
+#include <deal.II/lac/precondition.h>
 #include <deal.II/lac/solver_control.h>
 #include <deal.II/lac/solver_gmres.h>
 
@@ -502,6 +503,31 @@ namespace ImmersX
               sys.target = threshold / pr0 * sys.r0;
           }
       }
+    else if (parameters.gmres_tolerance_mode == "ida_left")
+      {
+        // IDA's test itself, ||W M^{-1}(b - Jx)||_2 <= sqrt(N) eps_L, is the
+        // residual of GMRES on W M^{-1} J W^{-1} y = W M^{-1} b, y = W x.
+        // The 2-norm of b is not used: residual rows of different fields
+        // need not scale like the corrections they produce.
+        sys.target = sys.r0;
+        if (seed.valid && parameters.policy != "direct")
+          {
+            sys.Mb = b;
+            sys.t_pre =
+              timed([&]() { operations.apply_factorization(sys.Mb, b); });
+            sys.has_Mb = true;
+            sys.left   = true;
+            sys.w      = w;
+            sys.w_inv  = w;
+            for (const auto i : w.locally_owned_elements())
+              sys.w_inv(i) = 1. / w(i);
+            sys.w_inv.compress(dealii::VectorOperation::insert);
+            sys.WMb = sys.Mb;
+            sys.WMb.scale(w);
+            sys.r0     = sys.WMb.l2_norm();
+            sys.target = std::sqrt(N) * sys.eps_L;
+          }
+      }
     else if (parameters.gmres_tolerance_mode == "ida")
       sys.target = ida_tolerance;
     else if (parameters.gmres_tolerance_mode == "fixed")
@@ -524,8 +550,8 @@ namespace ImmersX
     GmresResult res;
     res.target = sys.target;
 
-    // ida_forcing with eta >= 1: no iteration; the correction is M^{-1} b,
-    // as IDA does when its Krylov solver needs no iteration.
+    // ida_forcing, ida_left with eta >= 1: no iteration; the correction is
+    // M^{-1} b, as IDA does when its Krylov solver needs no iteration.
     if (sys.has_Mb && sys.r0 <= sys.target)
       {
         x      = sys.Mb;
@@ -534,6 +560,38 @@ namespace ImmersX
       }
 
     dealii::SolverControl control(cap, sys.target, false, false);
+    if (sys.left)
+      {
+        // Same work per iteration as the right-preconditioned solve: one
+        // Jacobian product and one backsolve, plus two diagonal scalings.
+        VectorType                                                  u(b), Ju(b);
+        const std::function<void(VectorType &, const VectorType &)> apply =
+          [&](VectorType &dst, const VectorType &src) {
+            u = src;
+            u.scale(sys.w_inv);
+            operations.apply_jacobian(Ju, u);
+            operations.apply_factorization(dst, Ju);
+            dst.scale(sys.w);
+          };
+        typename dealii::SolverGMRES<VectorType>::AdditionalData data(
+          parameters.absolute_iteration_cap + 1);
+        dealii::SolverGMRES<VectorType>             solver(control, data);
+        const internal::LaggingOperator<VectorType> A{apply};
+        x = 0.;
+        try
+          {
+            solver.solve(A, x, sys.WMb, dealii::PreconditionIdentity());
+          }
+        catch (const dealii::SolverControl::NoConvergence &)
+          {
+            res.converged = false;
+          }
+        x.scale(sys.w_inv);
+        res.m  = control.last_step();
+        res.r0 = control.initial_value();
+        res.rm = control.last_value();
+        return res;
+      }
     typename dealii::SolverGMRES<VectorType>::AdditionalData data(
       parameters.absolute_iteration_cap + 1, /*right_preconditioning=*/true);
     dealii::SolverGMRES<VectorType>             solver(control, data);
@@ -626,16 +684,16 @@ namespace ImmersX
         cost.T_a.add(t_solve, parameters.moving_average_weight);
         tot.time_direct += t_solve;
         ++tot.direct_solves;
-        // ida_forcing: M^{-1} b with the old factorization was spent on a
-        // decision that refactorized; count it as GMRES overhead.
+        // ida_forcing, ida_left: M^{-1} b with the old factorization was
+        // spent on a decision that refactorized; count it as GMRES overhead.
         tot.time_gmres += sys.t_pre;
       }
     else
       {
         kind = "lagged";
         cap  = iteration_cap();
-        // ida_forcing: the application M^{-1} b made for the forcing term is
-        // part of the cost of the lagged solve.
+        // ida_forcing, ida_left: the application M^{-1} b made for the
+        // forcing term is part of the cost of the lagged solve.
         t_solve = timed([&]() { g = gmres(r, sys, z, cap); }) + sys.t_pre;
         e       = std::max(0., t_solve - T_a());
         theta   = g.m > 0 && g.r0 > 0. ?

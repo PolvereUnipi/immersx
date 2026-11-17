@@ -263,12 +263,17 @@ namespace ImmersX
     {
       double target = 0., r0 = 0.;
       double eps_L = 0.;
-      // ida_forcing: M^{-1} b with the current factorization and the time
-      // spent on it. If no iteration is needed (eta >= 1) it is the
+      // ida_forcing, ida_left: M^{-1} b with the current factorization and
+      // the time spent on it. If no iteration is needed (eta >= 1) it is the
       // correction, as in IDA.
       VectorType Mb;
       bool       has_Mb = false;
       double     t_pre  = 0.;
+      // ida_left: GMRES runs on IDA's own test. Unknown y = W x, operator
+      // W M^{-1} J W^{-1}, right-hand side W M^{-1} b; r0 and target are
+      // 2-norms of that system's residual. w holds IDA's weights.
+      bool       left = false;
+      VectorType w, w_inv, WMb;
       // Forcing term: the relative reduction GMRES must achieve.
       double
       eta() const

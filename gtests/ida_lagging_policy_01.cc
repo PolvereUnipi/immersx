@@ -33,7 +33,9 @@ namespace
   using Policy = IDALaggingPolicy<Vector>;
 
   // J(t, y, alpha) = K + (alpha + 0.1 t + 0.01 ||y||) I with a nonsymmetric
-  // tridiagonal K, distributed over all ranks. The factorization acts on a
+  // tridiagonal K, distributed over all ranks; rows i >= n / 2 are scaled
+  // by row_scale, like the rows of a field whose equations are much smaller
+  // than its unknowns. The factorization acts on a
   // copy, so it stays fixed while J changes, as a lagged seed must. The
   // optional delays make the policy's timing rules fire deterministically.
   // The error weights mimic IDA's, 1 / (rtol |y| + atol): IDA's current
@@ -72,11 +74,12 @@ namespace
       const double shift = alpha + .1 * t + .01 * y.l2_norm();
       for (const auto i : owned)
         {
-          jacobian.set(i, i, 2. + shift);
+          const double s = i >= n / 2 ? row_scale : 1.;
+          jacobian.set(i, i, s * (2. + shift));
           if (i > 0)
-            jacobian.set(i, i - 1, -1.);
+            jacobian.set(i, i - 1, -s);
           if (i + 1 < n)
-            jacobian.set(i, i + 1, -.5);
+            jacobian.set(i, i + 1, -.5 * s);
         }
       jacobian.compress(dealii::VectorOperation::insert);
     }
@@ -163,6 +166,7 @@ namespace
     std::chrono::milliseconds factorize_delay{0}, jacobian_delay{0};
     Vector                    state;
     double                    weight_scale = 1.;
+    double                    row_scale    = 1.;
   };
 
   // T_F >= 10 ms and every Jacobian product >= 50 ms: R1 keeps the first
@@ -513,32 +517,88 @@ TEST(IDALaggingPolicy, BOTH_ForcingTermFollowsIDAsLinearTolerance)
   EXPECT_EQ(iterations[0], iterations[1]);
 }
 
-// ida_forcing with eta >= 1: M^{-1} b already passes IDA's test and is the
-// correction, without GMRES iterations.
-TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
+// ida_left meets IDA's linear test exactly, ||W M^{-1}(Jz - r)||_WRMS <=
+// eps_L with the factorization GMRES used, also when half of the rows are
+// 1e6 times smaller than the corrections they produce. The 2-norm of the
+// residual, which ida_forcing reduces, hardly sees those rows.
+TEST(IDALaggingPolicy, BOTH_LeftModeMeetsIDAsLinearTest)
 {
-  ToySystem system;
-  auto      knobs            = parameters("lag_always");
-  knobs.gmres_tolerance_mode = "ida_forcing";
-  Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+  const double       eps_L = 1.e-3;
+  const unsigned int N     = ToySystem::n;
+  ToySystem          system;
+  system.row_scale           = 1.e-6;
+  auto knobs                 = parameters("lag_always");
+  knobs.gmres_tolerance_mode = "ida_left";
+  Policy::IDATolerance tolerance;
+  tolerance.ls_norm_factor            = 1.;
+  tolerance.expected_linear_tolerance = eps_L;
+  Policy policy(knobs, tolerance, MPI_COMM_WORLD, system.operations());
   policy.start();
-  step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
-  const auto r = system.vector(-1.);
-  for (unsigned int s = 1; s < 4; ++s)
+  for (unsigned int s = 0; s < 4; ++s)
     {
-      const auto y = system.vector(1. + .1 * s);
+      const double t = .1 * s;
+      const auto   y = system.vector(1. + t);
+      auto         r = system.vector(-1.);
+      for (const auto i : system.owned)
+        if (i >= N / 2)
+          r(i) *= system.row_scale;
+      r.compress(dealii::VectorOperation::insert);
       system.state = y;
-      policy.residual(.1 * s, y, y);
-      policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
-      Vector z(r), Mr(r);
-      system.direct->solve(Mr, r);
-      policy.solve(r, z, 1.e8);
-      z -= Mr;
-      EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm());
+      policy.residual(t, y, y);
+      policy.setup_jacobian(t, y, y, 1. + .05 * s);
+
+      Vector w;
+      system.weights(w);
+      const double wbar = w.l2_norm() / std::sqrt(double(N));
+      Vector       z(r);
+      policy.solve(r, z, eps_L / wbar);
+      if (s > 0)
+        {
+          Vector d(r), Md(r);
+          system.jacobian.vmult(d, z);
+          d -= r;
+          system.direct->solve(Md, d);
+          Md.scale(w);
+          EXPECT_LE(Md.l2_norm() / std::sqrt(double(N)), eps_L * (1. + 1.e-6));
+        }
     }
   policy.finish();
-  EXPECT_EQ(policy.totals().lagged_solves, 3u);
-  EXPECT_EQ(policy.totals().gmres_iterations, 0u);
+  const auto &totals = policy.totals();
+  EXPECT_EQ(totals.factorizations, 1u);
+  EXPECT_EQ(totals.lagged_solves, 3u);
+  EXPECT_GT(totals.gmres_iterations, 0u);
+  EXPECT_NEAR(totals.eps_ratio_min, 1., 1.e-12);
+}
+
+// ida_forcing and ida_left with eta >= 1: M^{-1} b already passes IDA's
+// test and is the correction, without GMRES iterations.
+TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneUsesThePreconditionedResidual)
+{
+  for (const std::string mode : {"ida_forcing", "ida_left"})
+    {
+      ToySystem system;
+      auto      knobs            = parameters("lag_always");
+      knobs.gmres_tolerance_mode = mode;
+      Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+      policy.start();
+      step(policy, system, 0., 1., true, 1, 1.e-12, 1.e-10);
+      const auto r = system.vector(-1.);
+      for (unsigned int s = 1; s < 4; ++s)
+        {
+          const auto y = system.vector(1. + .1 * s);
+          system.state = y;
+          policy.residual(.1 * s, y, y);
+          policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
+          Vector z(r), Mr(r);
+          system.direct->solve(Mr, r);
+          policy.solve(r, z, 1.e8);
+          z -= Mr;
+          EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm()) << mode;
+        }
+      policy.finish();
+      EXPECT_EQ(policy.totals().lagged_solves, 3u) << mode;
+      EXPECT_EQ(policy.totals().gmres_iterations, 0u) << mode;
+    }
 }
 
 // Each state drift is measured from its own seed with that seed's final

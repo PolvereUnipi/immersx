@@ -65,8 +65,11 @@ namespace ImmersX
         "ida_forcing: ||b-Jx||_2 <= eta ||b||_2 with IDA's forcing term eta = "
         "sqrt(N) eps_L / ||W M^-1 b||_2, eps_L = eplifac * epsNewt recovered "
         "from the tolerance IDA passes | ida: ||b-Jx||_2 <= the tolerance IDA "
-        "passes (over-solves) | fixed: ||b-Jx||_2 <= tau ||b||_2",
-        dealii::Patterns::Selection("ida_forcing|ida|fixed"));
+        "passes (over-solves) | fixed: ||b-Jx||_2 <= tau ||b||_2 | "
+        "ida_left: IDA's own test ||W M^-1 (b-Jx)||_2 <= sqrt(N) eps_L, by "
+        "GMRES on W M^-1 J W^-1 (W x) = W M^-1 b; use it when residual rows "
+        "of different fields scale differently from their corrections",
+        dealii::Patterns::Selection("ida_forcing|ida_left|ida|fixed"));
       prm.add_parameter("GMRES fixed relative tolerance",
                         gmres_fixed_relative_tolerance,
                         "tau of the fixed mode.",
