@@ -572,48 +572,52 @@ TEST(IDALaggingPolicy, BOTH_LeftModeMeetsIDAsLinearTest)
 
 // ida_forcing and ida_left with eta >= 1, i.e. IDA's test already holds at
 // x = 0: a current factorization still returns M^{-1} b = J^{-1} b; a lagged
-// one returns 0, as SUNDIALS' SPGMR does, without GMRES iterations.
-TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneReturnsZeroWhenLagged)
+// one returns 0 or M^{-1} b, as "No-iteration correction" selects, without
+// GMRES iterations.
+TEST(IDALaggingPolicy, BOTH_ForcingTermAboveOneSkipsGMRES)
 {
   for (const std::string mode : {"ida_forcing", "ida_left"})
-    {
-      ToySystem system;
-      auto      knobs            = parameters("lag_always");
-      knobs.gmres_tolerance_mode = mode;
-      Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
-      policy.start();
-      const auto r = system.vector(-1.);
-      for (unsigned int s = 0; s < 4; ++s)
-        {
-          const auto y = system.vector(1. + .1 * s);
-          system.state = y;
-          policy.residual(.1 * s, y, y);
-          policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
-          // At s = 0 the second solve has a factorization (M = J) when it
-          // computes M^{-1} b.
-          for (unsigned int k = 0; k < (s == 0 ? 2u : 1u); ++k)
-            {
-              Vector z(r);
-              policy.solve(r, z, 1.e8);
-              if (s == 0)
-                {
-                  // The toy system holds a factorization only after the
-                  // policy's first one.
-                  Vector Mr(r);
-                  system.direct->solve(Mr, r);
-                  z -= Mr;
-                  EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm()) << mode;
-                }
-              else
-                EXPECT_EQ(z.l2_norm(), 0.) << mode;
-            }
-        }
-      policy.finish();
-      EXPECT_EQ(policy.totals().factorizations, 1u) << mode;
-      EXPECT_EQ(policy.totals().direct_solves, 2u) << mode;
-      EXPECT_EQ(policy.totals().lagged_solves, 3u) << mode;
-      EXPECT_EQ(policy.totals().gmres_iterations, 0u) << mode;
-    }
+    for (const std::string correction : {"zero", "preconditioned_rhs"})
+      {
+        SCOPED_TRACE(mode + ", " + correction);
+        ToySystem system;
+        auto      knobs               = parameters("lag_always");
+        knobs.gmres_tolerance_mode    = mode;
+        knobs.no_iteration_correction = correction;
+        Policy policy(knobs, {}, MPI_COMM_WORLD, system.operations());
+        policy.start();
+        const auto r = system.vector(-1.);
+        for (unsigned int s = 0; s < 4; ++s)
+          {
+            const auto y = system.vector(1. + .1 * s);
+            system.state = y;
+            policy.residual(.1 * s, y, y);
+            policy.setup_jacobian(.1 * s, y, y, 1. + .05 * s);
+            // At s = 0 the second solve has a factorization (M = J) when it
+            // computes M^{-1} b.
+            for (unsigned int k = 0; k < (s == 0 ? 2u : 1u); ++k)
+              {
+                Vector z(r);
+                policy.solve(r, z, 1.e8);
+                if (s > 0 && correction == "zero")
+                  EXPECT_EQ(z.l2_norm(), 0.);
+                else
+                  {
+                    // The toy system holds a factorization only after the
+                    // policy's first one; it is M, current at s = 0.
+                    Vector Mr(r);
+                    system.direct->solve(Mr, r);
+                    z -= Mr;
+                    EXPECT_LE(z.l2_norm(), 1.e-14 * Mr.l2_norm());
+                  }
+              }
+          }
+        policy.finish();
+        EXPECT_EQ(policy.totals().factorizations, 1u);
+        EXPECT_EQ(policy.totals().direct_solves, 2u);
+        EXPECT_EQ(policy.totals().lagged_solves, 3u);
+        EXPECT_EQ(policy.totals().gmres_iterations, 0u);
+      }
 }
 
 // Each state drift is measured from its own seed with that seed's final

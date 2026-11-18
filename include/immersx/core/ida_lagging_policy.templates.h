@@ -551,13 +551,19 @@ namespace ImmersX
     res.target = sys.target;
 
     // ida_forcing, ida_left with eta >= 1: IDA's test already holds at
-    // x = 0, and x = 0 is returned, as SUNDIALS' SPGMR does. M is lagged
-    // here (a current factorization takes the direct path), so M^{-1} b is
-    // one Richardson step and need not improve on 0: on the coupled app it
-    // missed IDA's test by 10-89x after a change of alpha.
+    // x = 0, no iteration. M is lagged here (a current factorization takes
+    // the direct path). zero returns x = 0, which passes the test by
+    // construction. preconditioned_rhs returns M^{-1} b, as IDA's Krylov
+    // solvers do: one Richardson step, which need not improve on 0 (on the
+    // coupled app it missed IDA's test by 10-89x after a change of alpha).
     if (sys.has_Mb && sys.r0 <= sys.target)
       {
-        x      = 0.;
+        if (parameters.no_iteration_correction == "zero")
+          x = 0.;
+        else if (parameters.no_iteration_correction == "preconditioned_rhs")
+          x = sys.Mb;
+        else
+          AssertThrow(false, dealii::ExcInternalError());
         res.r0 = res.rm = sys.r0;
         return res;
       }
@@ -890,6 +896,8 @@ namespace ImmersX
       << "\n"
       << "#   GMRES fixed relative tolerance  = "
       << p.gmres_fixed_relative_tolerance << "\n"
+      << "#   No-iteration correction         = " << p.no_iteration_correction
+      << "\n"
       << "#   Absolute iteration cap          = " << p.absolute_iteration_cap
       << "\n"
       << "#   Probe rule                      = " << p.probe_rule << "\n"

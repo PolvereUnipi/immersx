@@ -20,14 +20,18 @@ namespace ImmersX
    * across IDA Jacobian setups. Names and defaults follow MetricFlowX's
    * blood_flow_IDA_lagging driver. Differences: `off` keeps IDAAdapter's
    * plain direct solve, the prediction always uses the drift model with the
-   * pooled factor, and an empty log prefix writes no log files.
+   * pooled factor, an empty log prefix writes no log files, and GMRES stops
+   * on IDA's own linear test by default (ida_left): the driver's
+   * ida_forcing assumes residual rows that scale like their corrections,
+   * which coupled multi-field systems violate.
    */
   struct IDALaggingParameters
   {
     std::string  policy                          = "off";
     unsigned int operator_rebuild_every_n_solves = 0;
-    std::string  gmres_tolerance_mode            = "ida_forcing";
+    std::string  gmres_tolerance_mode            = "ida_left";
     double       gmres_fixed_relative_tolerance  = 1.e-8;
+    std::string  no_iteration_correction         = "zero";
     unsigned int absolute_iteration_cap          = 20;
     std::string  probe_rule                      = "alpha_check";
     unsigned int probe_interval_min              = 1;
@@ -62,18 +66,28 @@ namespace ImmersX
       prm.add_parameter(
         "GMRES tolerance mode",
         gmres_tolerance_mode,
-        "ida_forcing: ||b-Jx||_2 <= eta ||b||_2 with IDA's forcing term eta = "
-        "sqrt(N) eps_L / ||W M^-1 b||_2, eps_L = eplifac * epsNewt recovered "
-        "from the tolerance IDA passes | ida: ||b-Jx||_2 <= the tolerance IDA "
-        "passes (over-solves) | fixed: ||b-Jx||_2 <= tau ||b||_2 | "
-        "ida_left: IDA's own test ||W M^-1 (b-Jx)||_2 <= sqrt(N) eps_L, by "
-        "GMRES on W M^-1 J W^-1 (W x) = W M^-1 b; use it when residual rows "
-        "of different fields scale differently from their corrections",
-        dealii::Patterns::Selection("ida_forcing|ida_left|ida|fixed"));
+        "ida_left: IDA's own test ||W M^-1 (b-Jx)||_2 <= sqrt(N) eps_L, "
+        "eps_L = eplifac * epsNewt recovered from the tolerance IDA passes, "
+        "by GMRES on W M^-1 J W^-1 (W x) = W M^-1 b | ida_forcing: "
+        "||b-Jx||_2 <= eta ||b||_2 with eta = sqrt(N) eps_L / ||W M^-1 b||_2 "
+        "(the MetricFlowX driver's mode; misses IDA's test when residual rows "
+        "of different fields scale differently from their corrections) | "
+        "ida: ||b-Jx||_2 <= the tolerance IDA passes (over-solves) | fixed: "
+        "||b-Jx||_2 <= tau ||b||_2",
+        dealii::Patterns::Selection("ida_left|ida_forcing|ida|fixed"));
       prm.add_parameter("GMRES fixed relative tolerance",
                         gmres_fixed_relative_tolerance,
                         "tau of the fixed mode.",
                         dealii::Patterns::Double(0.));
+      prm.add_parameter(
+        "No-iteration correction",
+        no_iteration_correction,
+        "ida_left, ida_forcing, lagged solve with eta >= 1 (no GMRES "
+        "iteration): zero returns x = 0, which passes IDA's test by "
+        "construction | preconditioned_rhs returns M^-1 b, as IDA's Krylov "
+        "solvers do: usually more accurate (it is exact if M = J), but not "
+        "guaranteed to pass the test with a lagged M",
+        dealii::Patterns::Selection("zero|preconditioned_rhs"));
       prm.add_parameter(
         "Absolute iteration cap",
         absolute_iteration_cap,

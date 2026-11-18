@@ -264,8 +264,8 @@ namespace ImmersX
       double target = 0., r0 = 0.;
       double eps_L = 0.;
       // ida_forcing, ida_left: M^{-1} b with the current factorization and
-      // the time spent on it. If no iteration is needed (eta >= 1) it is the
-      // correction, as in IDA.
+      // the time spent on it. If no iteration is needed (eta >= 1), a lagged
+      // solve returns 0 or this, as "No-iteration correction" selects.
       VectorType Mb;
       bool       has_Mb = false;
       double     t_pre  = 0.;
