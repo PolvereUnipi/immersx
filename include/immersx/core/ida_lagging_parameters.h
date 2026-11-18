@@ -20,10 +20,11 @@ namespace ImmersX
    * across IDA Jacobian setups. Names and defaults follow MetricFlowX's
    * blood_flow_IDA_lagging driver. Differences: `off` keeps IDAAdapter's
    * plain direct solve, the prediction always uses the drift model with the
-   * pooled factor, an empty log prefix writes no log files, and GMRES stops
-   * on IDA's own linear test by default (ida_left): the driver's
-   * ida_forcing assumes residual rows that scale like their corrections,
-   * which coupled multi-field systems violate.
+   * pooled factor, an empty log prefix writes no log files, and a lagged
+   * solve without GMRES iterations returns M^-1 b by default, as IDA does.
+   * GMRES stops on IDA's own linear test by default (ida_left): ida_forcing
+   * assumes residual rows that scale like their corrections, which coupled
+   * multi-field systems violate.
    */
   struct IDALaggingParameters
   {
@@ -31,7 +32,7 @@ namespace ImmersX
     unsigned int operator_rebuild_every_n_solves = 0;
     std::string  gmres_tolerance_mode            = "ida_left";
     double       gmres_fixed_relative_tolerance  = 1.e-8;
-    std::string  no_iteration_correction         = "zero";
+    std::string  no_iteration_correction         = "preconditioned_rhs";
     unsigned int absolute_iteration_cap          = 20;
     std::string  probe_rule                      = "alpha_check";
     unsigned int probe_interval_min              = 1;
