@@ -40,9 +40,12 @@ namespace ImmersX
    * Sigma_s / Sigma_l compares drifts relative to their linearization points
    * even when the carried factor comes from an earlier seed.
    *
-   * Difference from the driver: the forcing term uses IDA's own error weights
-   * and recovers IDA's linear tolerance eps_L from the tolerance IDA passes
-   * and the ls_norm_factor, so it does not depend on that factor.
+   * As in the driver (since 2026-11-23), the forcing term uses IDA's own
+   * error weights and recovers IDA's linear tolerance eps_L from the
+   * tolerance IDA passes and the ls_norm_factor, and eta is computed only
+   * where it is read (decision points (i) and (ii)). The policy is kept
+   * identical to the driver and to PreconReuse_IDAPorts' common/ policy;
+   * the report's Setup section (tab:implementations) lists the three.
    */
   template <typename VectorType>
   class IDALaggingPolicy
@@ -209,9 +212,12 @@ namespace ImmersX
       double sigma_l_cur    = std::numeric_limits<double>::quiet_NaN();
       double theta_pred_cur = std::numeric_limits<double>::quiet_NaN();
       bool   cross_seed     = false;
-      // Pool of the lagged solves with m >= 1: sum of log(rm/r0), sum of m.
-      double       pool_log = 0.;
-      unsigned int pool_m   = 0;
+      // Pool of the lagged solves with m >= 1: sum of log(rm/r0), sum of m;
+      // pool_zero if one of them reached rm = 0 (the pooled factor is then 0,
+      // as eq:theta-pooled gives).
+      double       pool_log  = 0.;
+      unsigned int pool_m    = 0;
+      bool         pool_zero = false;
       // y_s - y_seed; kept as the carried displacement once this segment
       // measures a factor.
       VectorType displacement;

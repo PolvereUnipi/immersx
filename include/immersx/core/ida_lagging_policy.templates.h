@@ -647,8 +647,14 @@ namespace ImmersX
     double       m_hat = std::numeric_limits<double>::quiet_NaN();
     double       E_hat = m_hat;
 
-    // The forcing term of this solve is known before it is decided on.
-    const GmresSystem sys = gmres_system(r, ida_tolerance);
+    // The forcing term of this solve is known before it is decided on. It is
+    // computed only where it is read: at decision point (i) and when M is not
+    // a factorization of the current J (decision point (ii), lagged solve).
+    // Elsewhere the solve is direct and the application M^{-1} b behind eta
+    // would be wasted.
+    GmresSystem sys;
+    if (ns.new_operator || !seed.current)
+      sys = gmres_system(r, ida_tolerance);
 
     if (ns.new_operator)
       {
@@ -733,11 +739,17 @@ namespace ImmersX
                 displacement_last = seg.displacement;
               }
           }
+        // eq:theta-pooled = prod theta_j^(m_j/mu) = (prod rm/r0)^(1/mu),
+        // exactly: a solve with rm = 0 makes it 0.
         if (g.m > 0 && g.r0 > 0.)
           {
-            seg.pool_log += std::log(std::max(g.rm / g.r0, 1e-300));
+            if (g.rm > 0.)
+              seg.pool_log += std::log(g.rm / g.r0);
+            else
+              seg.pool_zero = true;
             seg.pool_m += g.m;
-            theta_pool = std::exp(seg.pool_log / seg.pool_m);
+            theta_pool =
+              seg.pool_zero ? 0. : std::exp(seg.pool_log / seg.pool_m);
           }
 
         // Prediction errors, with m_hat clipped to the cap: no solve can
